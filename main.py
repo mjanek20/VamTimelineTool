@@ -10,7 +10,8 @@ from PyQt6.QtGui import QAction, QIcon, QDrag
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QFileDialog, QLabel,
-    QMenu, QMessageBox, QInputDialog, QToolBar
+    QMenu, QMessageBox, QInputDialog, QToolBar, QFormLayout, QLineEdit,
+    QListWidget
 )
 
 # --- 1. Keyframe Encoding Logic ---
@@ -58,7 +59,10 @@ class FloatParameter:
         return cls(data.get("Storable"), data.get("Name"), data.get("Value", []), data.get("Min"), data.get("Max"))
 
     def to_dict(self):
-        return {"Storable": self.storable, "Name": self.name, "Value": self.value, "Min": self.min, "Max": self.max}
+        props = {"Storable": self.storable, "Name": self.name, "Value": self.value}
+        if self.min is not None: props["Min"] = self.min
+        if self.max is not None: props["Max"] = self.max
+        return props
 
 class ControllerTarget:
     def __init__(self, controller_id, **kwargs):
@@ -116,7 +120,7 @@ class AnimationClip:
         }
         data.update(self.other_properties)
         if self.float_params:
-            data["FloatParams"] = [p.to_dict() for p in sorted(self.float_params, key=lambda p: p.name)]
+            data["FloatParams"] = [p.to_dict() for p in sorted(self.float_params, key=lambda p: (p.storable, p.name))]
         if self.controllers:
             data["Controllers"] = [c.to_dict() for c in sorted(self.controllers, key=lambda c: c.id)]
         return data
@@ -420,6 +424,125 @@ class AnimationTreeWidget(QTreeWidget):
         action = menu.exec(self.viewport().mapToGlobal(position))
         if action == new_segment_action: self.parent_window.create_new_segment()
 
+
+class ClipPropertiesPanel(QWidget):
+    """A widget to display and edit properties of a selected AnimationClip."""
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.clip = None
+        self.current_tree_item = None
+        self.init_ui()
+        self.clear() # Initially hidden
+
+    def init_ui(self):
+        self.layout = QVBoxLayout(self)
+        self.form_layout = QFormLayout()
+
+        # Editable Name
+        self.name_edit = QLineEdit()
+        self.name_edit.editingFinished.connect(self.on_name_changed)
+        self.form_layout.addRow("Name:", self.name_edit)
+
+        self.layout.addLayout(self.form_layout)
+        
+        # General Info
+        self.layout.addWidget(QLabel("<b>General</b>"))
+        self.general_form_layout = QFormLayout()
+        self.segment_label = QLabel()
+        self.layer_label = QLabel()
+        self.length_label = QLabel()
+        self.loop_label = QLabel()
+        self.general_form_layout.addRow("Segment:", self.segment_label)
+        self.general_form_layout.addRow("Layer:", self.layer_label)
+        self.general_form_layout.addRow("Length:", self.length_label)
+        self.general_form_layout.addRow("Loop:", self.loop_label)
+        self.layout.addLayout(self.general_form_layout)
+
+        # Sequencing Info
+        self.layout.addWidget(QLabel("<b>Sequencing</b>"))
+        self.sequence_form_layout = QFormLayout()
+        self.next_anim_label = QLabel()
+        self.sequence_form_layout.addRow("Next Animation:", self.next_anim_label)
+        self.layout.addLayout(self.sequence_form_layout)
+
+        # Targets List
+        self.layout.addWidget(QLabel("<b>Targets</b>"))
+        self.controller_list = QListWidget()
+        self.layout.addWidget(self.controller_list)
+
+        self.layout.addStretch()
+
+    def display_clip_properties(self, clip, item):
+        self.clip = clip
+        self.current_tree_item = item
+        
+        self.name_edit.setText(clip.name)
+        self.segment_label.setText(clip.segment)
+        self.layer_label.setText(clip.layer)
+        self.length_label.setText(f"{clip.length:.3f}s")
+        
+        is_loop = clip.other_properties.get('Loop', '0') == '1'
+        self.loop_label.setText("Yes" if is_loop else "No")
+        
+        next_anim = clip.other_properties.get('NextAnimationName', 'None')
+        self.next_anim_label.setText(next_anim)
+
+        self.controller_list.clear()
+        
+        targets = []
+        for controller in clip.controllers:
+            targets.append(f"[C] {controller.id}")
+        for param in clip.float_params:
+            targets.append(f"[F] {param.storable}/{param.name}")
+        
+        if targets:
+            self.controller_list.addItems(sorted(targets))
+        else:
+            self.controller_list.addItem("No targets in this clip.")
+
+        self.show()
+
+    def on_name_changed(self):
+        if not self.clip: return
+
+        old_name = self.clip.name
+        new_name = self.name_edit.text().strip()
+
+        if not new_name or new_name == old_name:
+            self.name_edit.setText(old_name) # Revert if empty or unchanged
+            return
+
+        # Check for name collisions within the same layer
+        for other_clip in self.main_window.animation_file.clips:
+            if (other_clip is not self.clip and
+                other_clip.segment == self.clip.segment and
+                other_clip.layer == self.clip.layer and
+                other_clip.name == new_name):
+                QMessageBox.warning(self, "Name Conflict", 
+                                    f"A clip named '{new_name}' already exists in this layer. Please choose a different name.")
+                self.name_edit.setText(old_name)
+                return
+        
+        # Update the name and find other clips that need updating
+        self.clip.name = new_name
+        
+        # Update NextAnimationName in other clips
+        for other_clip in self.main_window.animation_file.clips:
+            if other_clip.other_properties.get("NextAnimationName") == old_name:
+                if other_clip.layer == self.clip.layer and other_clip.segment == self.clip.segment:
+                    other_clip.other_properties["NextAnimationName"] = new_name
+
+        # Update the tree item text
+        if self.current_tree_item:
+            self.current_tree_item.setText(0, f"    Clip: {new_name}")
+
+    def clear(self):
+        self.clip = None
+        self.current_tree_item = None
+        self.hide()
+
+
 # --- 4. Main Application Window ---
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -464,17 +587,38 @@ class MainWindow(QMainWindow):
         
         self.tree = AnimationTreeWidget(self)
         self.tree.setHeaderLabels(["Segment / Layer / Animation"])
+        self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
         left_layout.addWidget(QLabel("Animation Structure:"))
         left_layout.addWidget(self.tree)
         
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        self.properties_label = QLabel("Select an item in the tree to see its properties.")
-        right_layout.addWidget(self.properties_label)
-        right_layout.addStretch()
-
+        # Right panel for properties
+        self.properties_panel = ClipPropertiesPanel(self)
+        
+        self.placeholder_label = QLabel("Select a clip to see its properties.")
+        self.placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        right_stack = QWidget()
+        self.right_stack_layout = QVBoxLayout(right_stack)
+        self.right_stack_layout.addWidget(self.placeholder_label)
+        self.right_stack_layout.addWidget(self.properties_panel)
+        
         main_layout.addWidget(left_panel)
-        main_layout.addWidget(right_panel)
+        main_layout.addWidget(right_stack)
+
+    def on_tree_selection_changed(self):
+        selected_items = self.tree.selectedItems()
+        if selected_items:
+            item = selected_items[0]
+            clip_data = item.data(0, 1000)
+            if isinstance(clip_data, AnimationClip):
+                self.properties_panel.display_clip_properties(clip_data, item)
+                self.placeholder_label.hide()
+            else:
+                self.properties_panel.clear()
+                self.placeholder_label.show()
+        else:
+            self.properties_panel.clear()
+            self.placeholder_label.show()
 
     def open_file(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Open Animation File", "", "JSON Files (*.json)")
@@ -502,9 +646,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Error saving file: {e}")
 
     def populate_animation_tree(self):
-        self.tree.clear()
-        if not self.animation_file: return
-
+        self.tree.itemSelectionChanged.disconnect(self.on_tree_selection_changed)
+        
         expanded_items = {}
         for i in range(self.tree.topLevelItemCount()):
             item = self.tree.topLevelItem(i)
@@ -514,6 +657,9 @@ class MainWindow(QMainWindow):
                     child = item.child(j)
                     if child.isExpanded():
                         expanded_items[f"{item.text(0)}/{child.text(0)}"] = True
+                        
+        self.tree.clear()
+        if not self.animation_file: return
 
         grouped_clips = defaultdict(lambda: defaultdict(list))
         for clip in self.animation_file.clips:
@@ -534,6 +680,8 @@ class MainWindow(QMainWindow):
                     clip_item = QTreeWidgetItem(layer_item, [f"    Clip: {clip_obj.name}"])
                     clip_item.setData(0, 1000, clip_obj)
         
+        self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
+
     def create_new_segment(self):
         if not self.animation_file: return
         text, ok = QInputDialog.getText(self, 'New Segment', 'Enter a name for the new segment:')
