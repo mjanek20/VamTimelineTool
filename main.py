@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QFileDialog, QLabel,
     QMenu, QMessageBox, QInputDialog, QToolBar, QFormLayout, QLineEdit,
-    QListWidget, QPlainTextEdit
+    QListWidget, QPlainTextEdit, QPushButton, QDialog, QDialogButtonBox
 )
 
 # --- 1. Keyframe Encoding Logic ---
@@ -171,6 +171,19 @@ class AnimationTreeWidget(QTreeWidget):
                 color: black;
             }
         """)
+
+        self.itemDoubleClicked.connect(self.on_item_double_clicked)
+    
+    def on_item_double_clicked(self, item, column):
+        self.parent_window.rename_selected_item()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_F2:
+            self.parent_window.rename_selected_item()
+        elif event.key() == Qt.Key.Key_Delete:
+            self.parent_window.delete_selected_items()
+        else:
+            super().keyPressEvent(event)
 
     def dragEnterEvent(self, event):
         if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]:
@@ -447,6 +460,7 @@ class AnimationTreeWidget(QTreeWidget):
                 self.parent_window.animation_file.clips.append(new_clip_obj)
                 existing_names_in_target.add(new_name)
                 self.parent_window.log_message(f"Copied clip '{source_clip_obj.name}' to '{target_segment_name}/{target_layer_name}'.")
+
             else:
                 self.parent_window.log_message(f"Moved clip '{source_clip_obj.name}' from '{source_segment_name}/{source_layer_name}' to '{target_segment_name}/{target_layer_name}'.")
                 source_clip_obj.name = new_name
@@ -457,13 +471,26 @@ class AnimationTreeWidget(QTreeWidget):
     def open_context_menu(self, position):
         menu = QMenu(self)
         selected_items = self.selectedItems()
+
         if selected_items:
-            # Check if any selected item is a clip
-            if any(isinstance(item.data(0, 1000), AnimationClip) for item in selected_items):
-                delete_action = menu.addAction(QIcon.fromTheme("edit-delete"), f"Delete {len(selected_items)} selected item(s)")
-                delete_action.triggered.connect(self.parent_window.delete_selected_items)
+            item = selected_items[0]
+            # --- Single Item Actions ---
+            if len(selected_items) == 1:
+                rename_action = menu.addAction("Rename...")
+                rename_action.setShortcut("F2")
+                rename_action.triggered.connect(self.parent_window.rename_selected_item)
+
+                if item.parent() and item.parent().parent(): # Is a clip item
+                    duplicate_action = menu.addAction("Duplicate Clip")
+                    duplicate_action.setShortcut("Ctrl+D")
+                    duplicate_action.triggered.connect(self.parent_window.duplicate_selected_clip)
+
+            # --- Multi-Item Actions ---
+            # Action to delete any type of selected item (clip, layer, segment)
+            delete_action = menu.addAction(QIcon.fromTheme("edit-delete"), f"Delete {len(selected_items)} selected item(s)")
+            delete_action.setShortcut("Delete")
+            delete_action.triggered.connect(self.parent_window.delete_selected_items)
         
-        # Only show context menu if there are actions to perform
         if not menu.isEmpty():
             menu.exec(self.viewport().mapToGlobal(position))
 
@@ -519,7 +546,11 @@ class ClipPropertiesPanel(QWidget):
         self.clip = clip
         self.current_tree_item = item
         
+        # Temporarily block signals to prevent on_name_changed from firing
+        self.name_edit.blockSignals(True)
         self.name_edit.setText(clip.name)
+        self.name_edit.blockSignals(False)
+        
         self.segment_label.setText(clip.segment)
         self.layer_label.setText(clip.layer)
         self.length_label.setText(f"{clip.length:.3f}s")
@@ -547,39 +578,9 @@ class ClipPropertiesPanel(QWidget):
 
     def on_name_changed(self):
         if not self.clip: return
-
-        old_name = self.clip.name
-        new_name = self.name_edit.text().strip()
-
-        if not new_name or new_name == old_name:
-            self.name_edit.setText(old_name) # Revert if empty or unchanged
-            return
-
-        # Check for name collisions within the same layer
-        for other_clip in self.main_window.animation_file.clips:
-            if (other_clip is not self.clip and
-                other_clip.segment == self.clip.segment and
-                other_clip.layer == self.clip.layer and
-                other_clip.name == new_name):
-                QMessageBox.warning(self, "Name Conflict", 
-                                    f"A clip named '{new_name}' already exists in this layer. Please choose a different name.")
-                self.name_edit.setText(old_name)
-                return
-        
-        # Update the name and find other clips that need updating
-        self.clip.name = new_name
-        self.main_window.log_message(f"Renamed clip '{old_name}' to '{new_name}'.")
-        
-        # Update NextAnimationName in other clips that reference the old name
-        for other_clip in self.main_window.animation_file.clips:
-            if other_clip.other_properties.get("NextAnimationName") == old_name:
-                if other_clip.layer == self.clip.layer and other_clip.segment == self.clip.segment:
-                    other_clip.other_properties["NextAnimationName"] = new_name
-                    self.main_window.log_message(f"Updated NextAnimationName for clip '{other_clip.name}' to '{new_name}'.")
-
-        # Update the tree item text
-        if self.current_tree_item:
-            self.current_tree_item.setText(0, f"    Clip: {new_name}")
+        self.main_window.update_clip_name(
+            self.clip, self.current_tree_item, self.name_edit.text()
+        )
 
     def clear(self):
         self.clip = None
@@ -609,10 +610,21 @@ class MainWindow(QMainWindow):
 
         new_segment_action = QAction(QIcon.fromTheme("list-add"), "New &Segment...", self)
         new_segment_action.triggered.connect(self.create_new_segment)
+        
+        rename_action = QAction(QIcon.fromTheme("edit-rename"), "Re&name...", self)
+        rename_action.setShortcut("F2")
+        rename_action.triggered.connect(self.rename_selected_item)
+
+        batch_rename_action = QAction("Change Names in &Batch...", self)
+        batch_rename_action.triggered.connect(self.batch_rename_items)
 
         delete_action = QAction(QIcon.fromTheme("edit-delete"), "&Delete Selected", self)
         delete_action.setShortcut("Delete")
         delete_action.triggered.connect(self.delete_selected_items)
+
+        duplicate_action = QAction(QIcon.fromTheme("edit-copy"), "&Duplicate Clip", self)
+        duplicate_action.setShortcut("Ctrl+D")
+        duplicate_action.triggered.connect(self.duplicate_selected_clip)
 
         # --- Menu Bar ---
         menu_bar = self.menuBar()
@@ -625,6 +637,10 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_action)
         
         edit_menu = menu_bar.addMenu("&Edit")
+        edit_menu.addAction(rename_action)
+        edit_menu.addAction(batch_rename_action)
+        edit_menu.addAction(duplicate_action)
+        edit_menu.addSeparator()
         edit_menu.addAction(delete_action)
         
         # --- Toolbar ---
@@ -645,14 +661,27 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_panel.setFixedWidth(400)
 
+        # --- Filter and Control Buttons Layout ---
+        filter_layout = QHBoxLayout()
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("Filter animations...")
         self.filter_edit.textChanged.connect(self.filter_tree)
-        left_layout.addWidget(self.filter_edit)
+        filter_layout.addWidget(self.filter_edit)
+        
+        self.fold_all_button = QPushButton("Fold All")
+        self.fold_all_button.clicked.connect(self.fold_all_items)
+        filter_layout.addWidget(self.fold_all_button)
+        
+        self.unfold_all_button = QPushButton("Unfold All")
+        self.unfold_all_button.clicked.connect(self.unfold_all_items)
+        filter_layout.addWidget(self.unfold_all_button)
+        
+        left_layout.addLayout(filter_layout)
         
         self.tree = AnimationTreeWidget(self)
         self.tree.setHeaderLabels(["Segment / Layer / Animation"])
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
+        self.tree.itemChanged.connect(self.on_item_renamed)
         left_layout.addWidget(self.tree)
         
         # Right Panel (Properties and Log)
@@ -680,6 +709,36 @@ class MainWindow(QMainWindow):
         
         self.log_message("Application started.")
 
+    def get_tree_collapse_state(self):
+        """
+        Saves the state of COLLAPSED items. This implements an "open by default" policy.
+        """
+        state = set()
+        for i in range(self.tree.topLevelItemCount()):
+            segment_item = self.tree.topLevelItem(i)
+            segment_key = segment_item.text(0)
+            if not segment_item.isExpanded():
+                state.add(segment_key)
+            else:
+                for j in range(segment_item.childCount()):
+                    layer_item = segment_item.child(j)
+                    if not layer_item.isExpanded():
+                        layer_key = f"{segment_key}::{layer_item.text(0)}"
+                        state.add(layer_key)
+        return state
+
+    def fold_all_items(self):
+        """Collapses all items in the tree view."""
+        if self.tree:
+            self.tree.collapseAll()
+            self.log_message("All items folded.")
+
+    def unfold_all_items(self):
+        """Expands all items in the tree view."""
+        if self.tree:
+            self.tree.expandAll()
+            self.log_message("All items unfolded.")
+
     def log_message(self, message):
         """Appends a timestamped message to the console log."""
         timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
@@ -703,8 +762,8 @@ class MainWindow(QMainWindow):
     def filter_tree(self, text):
         """Filters the tree based on the input text."""
         search_text = text.lower()
+        is_filtering = bool(search_text)
         
-        # Iterate over all items and hide/show them
         for i in range(self.tree.topLevelItemCount()):
             segment_item = self.tree.topLevelItem(i)
             segment_visible = False
@@ -713,25 +772,30 @@ class MainWindow(QMainWindow):
                 layer_visible = False
                 for k in range(layer_item.childCount()):
                     clip_item = layer_item.child(k)
-                    # Check if the clip name contains the search text
                     if search_text in clip_item.text(0).lower():
                         clip_item.setHidden(False)
                         layer_visible = True
                     else:
                         clip_item.setHidden(True)
                 
-                # If any clip in the layer is visible, the layer must be visible
                 if layer_visible or search_text in layer_item.text(0).lower():
                     layer_item.setHidden(False)
                     segment_visible = True
+                    if is_filtering:
+                        layer_item.setExpanded(True)
                 else:
                     layer_item.setHidden(True)
 
-            # If any layer in the segment is visible, the segment must be visible
             if segment_visible or search_text in segment_item.text(0).lower():
                 segment_item.setHidden(False)
+                if is_filtering:
+                    segment_item.setExpanded(True)
             else:
                 segment_item.setHidden(True)
+        
+        if not is_filtering:
+            # If filter is cleared, repopulate to restore the original collapse state
+            self.populate_animation_tree()
 
     def open_file(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Open Animation File", "", "JSON Files (*.json)")
@@ -740,7 +804,7 @@ class MainWindow(QMainWindow):
                 with open(file_name, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 self.animation_file = AnimationFile.from_dict(data)
-                self.populate_animation_tree()
+                self.populate_animation_tree(is_first_load=True)
                 self.setWindowTitle(f"VamTimeline Animation Editor - {file_name}")
                 self.log_message(f"File opened: {file_name}")
             except Exception as e:
@@ -764,22 +828,15 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Error saving file: {e}")
                 self.log_message(f"ERROR: Failed to save file. Reason: {e}")
 
-    def populate_animation_tree(self):
+    def populate_animation_tree(self, is_first_load=False):
         self.tree.itemSelectionChanged.disconnect(self.on_tree_selection_changed)
         
-        # Store expansion state
-        expanded_items = {}
-        for i in range(self.tree.topLevelItemCount()):
-            item = self.tree.topLevelItem(i)
-            if item.isExpanded():
-                expanded_items[item.text(0)] = True
-                for j in range(item.childCount()):
-                    child = item.child(j)
-                    if child.isExpanded():
-                        expanded_items[f"{item.text(0)}/{child.text(0)}"] = True
+        collapse_state = {} if is_first_load else self.get_tree_collapse_state()
                         
         self.tree.clear()
-        if not self.animation_file: return
+        if not self.animation_file: 
+            self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
+            return
 
         grouped_clips = defaultdict(lambda: defaultdict(list))
         for clip in self.animation_file.clips:
@@ -788,19 +845,28 @@ class MainWindow(QMainWindow):
         for segment_name in sorted(grouped_clips.keys()):
             layers = grouped_clips[segment_name]
             segment_item = QTreeWidgetItem(self.tree, [f"Segment: {segment_name}"])
-            segment_item.setExpanded(expanded_items.get(segment_item.text(0), True))
+            segment_item.setData(0, 1000, "segment")
+            segment_item.setFlags(segment_item.flags() | Qt.ItemFlag.ItemIsEditable)
+            segment_key = segment_item.text(0)
+            segment_item.setExpanded(segment_key not in collapse_state)
             
             for layer_name in sorted(layers.keys()):
                 clips = layers[layer_name]
                 layer_item = QTreeWidgetItem(segment_item, [f"  Layer: {layer_name}"])
-                layer_item.setExpanded(expanded_items.get(f"{segment_item.text(0)}/{layer_item.text(0)}", True))
+                layer_item.setData(0, 1000, "layer")
+                layer_item.setFlags(layer_item.flags() | Qt.ItemFlag.ItemIsEditable)
+                layer_key = f"{segment_key}::{layer_item.text(0)}"
+                layer_item.setExpanded(layer_key not in collapse_state)
                 
                 clips.sort(key=lambda c: c.order_index)
                 for clip_obj in clips:
                     clip_item = QTreeWidgetItem(layer_item, [f"    Clip: {clip_obj.name}"])
                     clip_item.setData(0, 1000, clip_obj)
+                    clip_item.setFlags(clip_item.flags() | Qt.ItemFlag.ItemIsEditable)
         
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
+        # We don't call filter_tree here anymore to prevent collapse state override
+        # The filter is reapplied when text changes or cleared.
 
     def create_new_segment(self):
         if not self.animation_file: 
@@ -824,17 +890,250 @@ class MainWindow(QMainWindow):
         selected_items = self.tree.selectedItems()
         if not selected_items: return
 
-        clips_to_delete = {item.data(0, 1000) for item in selected_items if isinstance(item.data(0, 1000), AnimationClip)}
-        if not clips_to_delete: return
+        # Identify what to delete
+        segments_to_delete = set()
+        layers_to_delete = set() # as (segment_name, layer_name) tuples
+        clips_to_delete = set()
 
-        clip_names = [c.name for c in clips_to_delete]
+        for item in selected_items:
+            item_type = item.data(0, 1000)
+            if item_type == "segment":
+                segments_to_delete.add(item.text(0).replace("Segment: ", "").strip())
+            elif item_type == "layer":
+                layer_name = item.text(0).replace("  Layer: ", "").strip()
+                segment_name = item.parent().text(0).replace("Segment: ", "").strip()
+                layers_to_delete.add((segment_name, layer_name))
+            elif isinstance(item_type, AnimationClip):
+                clips_to_delete.add(item_type)
+
+        if not any([segments_to_delete, layers_to_delete, clips_to_delete]):
+            return
+
         reply = QMessageBox.question(self, 'Confirm Deletion',
-                                     f"Are you sure you want to delete {len(clips_to_delete)} clip(s)?",
+                                     f"Are you sure you want to delete the selected item(s) and all their contents?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        
         if reply == QMessageBox.StandardButton.Yes:
-            self.animation_file.clips = [c for c in self.animation_file.clips if c not in clips_to_delete]
-            self.log_message(f"Deleted {len(clip_names)} clip(s): {', '.join(f'\'{n}\'' for n in clip_names)}.")
+            initial_clip_count = len(self.animation_file.clips)
+            
+            # Build a list of clips to keep
+            clips_to_keep = []
+            for c in self.animation_file.clips:
+                if c in clips_to_delete:
+                    continue
+                if c.segment in segments_to_delete:
+                    continue
+                if (c.segment, c.layer) in layers_to_delete:
+                    continue
+                clips_to_keep.append(c)
+
+            self.animation_file.clips = clips_to_keep
+            deleted_count = initial_clip_count - len(clips_to_keep)
+            self.log_message(f"Deleted {deleted_count} clip(s) as part of deleting selected segments/layers/clips.")
             self.populate_animation_tree()
+            
+    def rename_selected_item(self):
+        if not self.tree.currentItem(): return
+        self.tree.editItem(self.tree.currentItem(), 0)
+
+    def on_item_renamed(self, item, column):
+        item_type = item.data(0, 1000)
+        
+        if item_type == "segment":
+            old_name = item.text(0).replace("Segment: ", "").strip()
+            # This is a placeholder for the real old name, which we need to deduce
+            # For simplicity, we find it by looking at the first child's data
+            if item.childCount() > 0 and item.child(0).childCount() > 0:
+                 old_name = item.child(0).child(0).data(0, 1000).segment
+            self.handle_segment_rename(item, old_name)
+        elif item_type == "layer":
+            self.handle_layer_rename(item)
+        elif isinstance(item_type, AnimationClip):
+            self.update_clip_name(item_type, item, item.text(0).replace("Clip: ", "").strip())
+
+    def handle_segment_rename(self, item, old_name):
+        new_name = item.text(0).replace("Segment: ", "").strip()
+        
+        self.tree.blockSignals(True)
+        if not new_name or new_name == old_name:
+            item.setText(0, f"Segment: {old_name}")
+            self.tree.blockSignals(False)
+            return
+
+        if any(c.segment == new_name for c in self.animation_file.clips):
+            QMessageBox.warning(self, "Name Conflict", f"A segment named '{new_name}' already exists.")
+            item.setText(0, f"Segment: {old_name}")
+            self.tree.blockSignals(False)
+            return
+            
+        for clip in self.animation_file.clips:
+            if clip.segment == old_name:
+                clip.segment = new_name
+                
+        self.log_message(f"Renamed segment '{old_name}' to '{new_name}'. All child clips updated.")
+        item.setText(0, f"Segment: {new_name}")
+        self.tree.blockSignals(False)
+        self.populate_animation_tree()
+
+    def handle_layer_rename(self, item):
+        new_name = item.text(0).replace("Layer: ", "").replace("  ", "").strip()
+        segment_name = item.parent().text(0).replace("Segment: ", "").strip()
+        
+        old_name = new_name # Placeholder
+        if item.childCount() > 0:
+            old_name = item.child(0).data(0, 1000).layer
+            
+        self.tree.blockSignals(True)
+        if not new_name or new_name == old_name:
+            item.setText(0, f"  Layer: {old_name}")
+            self.tree.blockSignals(False)
+            return
+            
+        if any(c.layer == new_name and c.segment == segment_name for c in self.animation_file.clips):
+            QMessageBox.warning(self, "Name Conflict", f"A layer named '{new_name}' already exists in this segment.")
+            item.setText(0, f"  Layer: {old_name}")
+            self.tree.blockSignals(False)
+            return
+        
+        for clip in self.animation_file.clips:
+            if clip.segment == segment_name and clip.layer == old_name:
+                clip.layer = new_name
+        
+        self.log_message(f"Renamed layer '{old_name}' to '{new_name}' in segment '{segment_name}'.")
+        item.setText(0, f"  Layer: {new_name}")
+        self.tree.blockSignals(False)
+        self.populate_animation_tree()
+
+    def update_clip_name(self, clip, tree_item, new_name_raw):
+        old_name = clip.name
+        new_name = new_name_raw.strip()
+        
+        # This function might be called from the properties panel
+        # To avoid re-triggering, block signals on the editor if it's focused
+        editor = self.properties_panel.name_edit
+        was_blocked = editor.signalsBlocked()
+        editor.blockSignals(True)
+        
+        if not new_name or new_name == old_name:
+            editor.setText(old_name)
+            editor.blockSignals(was_blocked)
+            return
+            
+        for other_clip in self.animation_file.clips:
+            if (other_clip is not clip and
+                other_clip.segment == clip.segment and
+                other_clip.layer == clip.layer and
+                other_clip.name == new_name):
+                QMessageBox.warning(self, "Name Conflict", f"A clip named '{new_name}' already exists in this layer.")
+                editor.setText(old_name)
+                tree_item.setText(0, f"    Clip: {old_name}")
+                editor.blockSignals(was_blocked)
+                return
+
+        clip.name = new_name
+        self.log_message(f"Renamed clip '{old_name}' to '{new_name}'.")
+
+        for other_clip in self.animation_file.clips:
+            if other_clip.other_properties.get("NextAnimationName") == old_name:
+                if other_clip.layer == clip.layer and other_clip.segment == clip.segment:
+                    other_clip.other_properties["NextAnimationName"] = new_name
+                    self.log_message(f"Updated NextAnimationName for clip '{other_clip.name}' to '{new_name}'.")
+
+        editor.setText(new_name)
+        tree_item.setText(0, f"    Clip: {new_name}")
+        editor.blockSignals(was_blocked)
+
+    def duplicate_selected_clip(self):
+        item = self.tree.currentItem()
+        if not item: return
+        clip_obj = item.data(0, 1000)
+        if not isinstance(clip_obj, AnimationClip): return
+
+        # Find a unique name for the copy
+        base_name = clip_obj.name
+        new_name = f"{base_name} (copy)"
+        layer_clips = [c for c in self.animation_file.clips if c.segment == clip_obj.segment and c.layer == clip_obj.layer]
+        existing_names = {c.name for c in layer_clips}
+        
+        counter = 2
+        while new_name in existing_names:
+            new_name = f"{base_name} (copy {counter})"
+            counter += 1
+
+        new_clip = copy.deepcopy(clip_obj)
+        new_clip.name = new_name
+        new_clip.order_index = max((c.order_index for c in self.animation_file.clips), default=-1) + 1
+        
+        self.animation_file.clips.append(new_clip)
+        self.log_message(f"Duplicated clip '{clip_obj.name}' as '{new_name}' in '{new_clip.segment}/{new_clip.layer}'.")
+        self.populate_animation_tree()
+
+    def batch_rename_items(self):
+        selected_items = [item.data(0, 1000) for item in self.tree.selectedItems() if isinstance(item.data(0, 1000), AnimationClip)]
+        if not selected_items:
+            QMessageBox.information(self, "Info", "Select one or more clips to rename.")
+            return
+
+        dialog = BatchRenameDialog(self)
+        if dialog.exec():
+            find_text = dialog.find_edit.text()
+            replace_text = dialog.replace_edit.text()
+            prefix = dialog.prefix_edit.text()
+            suffix = dialog.suffix_edit.text()
+            
+            renamed_count = 0
+            for clip in selected_items:
+                original_name = clip.name
+                new_name = original_name
+                
+                if find_text:
+                    new_name = new_name.replace(find_text, replace_text)
+                if prefix:
+                    new_name = prefix + new_name
+                if suffix:
+                    new_name = new_name + suffix
+                    
+                if new_name != original_name:
+                    # Check for conflicts
+                    is_conflict = any(c.name == new_name and c.layer == clip.layer and c.segment == clip.segment
+                                    for c in self.animation_file.clips if c is not clip)
+                    if is_conflict:
+                        self.log_message(f"SKIPPED batch rename for '{original_name}' to '{new_name}' due to name conflict.")
+                        continue
+                    
+                    clip.name = new_name
+                    # Also update references
+                    for other_clip in self.animation_file.clips:
+                        if other_clip.other_properties.get("NextAnimationName") == original_name and \
+                           other_clip.layer == clip.layer and other_clip.segment == clip.segment:
+                           other_clip.other_properties["NextAnimationName"] = new_name
+                           
+                    renamed_count += 1
+            
+            self.log_message(f"Batch renamed {renamed_count} clip(s).")
+            self.populate_animation_tree()
+
+class BatchRenameDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Rename Clips")
+        layout = QFormLayout(self)
+        
+        self.find_edit = QLineEdit()
+        self.replace_edit = QLineEdit()
+        self.prefix_edit = QLineEdit()
+        self.suffix_edit = QLineEdit()
+        
+        layout.addRow("Find text:", self.find_edit)
+        layout.addRow("Replace with:", self.replace_edit)
+        layout.addRow(QLabel("--- OR ---"))
+        layout.addRow("Add Prefix:", self.prefix_edit)
+        layout.addRow("Add Suffix:", self.suffix_edit)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
 
 # --- 5. Application Entry Point ---
 if __name__ == '__main__':
