@@ -1,6 +1,7 @@
 import sys
 import json
 import copy
+import struct
 from collections import defaultdict
 
 # Using PyQt6 for the GUI
@@ -12,10 +13,36 @@ from PyQt6.QtWidgets import (
     QMenu, QMessageBox, QInputDialog, QToolBar
 )
 
-# --- 1. Data Model ---
+# --- 1. Keyframe Encoding Logic ---
+
+class KeyframeEncoder:
+    """
+    Replicates the keyframe encoding/decoding logic from AtomAnimationSerializer.cs.
+    """
+    @staticmethod
+    def encode_keyframe(time: float, value: float, curve_type: int, last_v: float, last_c: int) -> str:
+        """Encodes a single keyframe into the plugin's string format."""
+        sb = []
+        
+        has_value = abs(last_v - value) > 1e-7
+        has_curve_type = last_c != curve_type
+
+        encoded_flag = 0
+        if has_value: encoded_flag |= (1 << 0)
+        if has_curve_type: encoded_flag |= (1 << 1)
+        sb.append(chr(ord('A') + encoded_flag))
+
+        sb.append(struct.pack('<f', time).hex().upper())
+        if has_value:
+            sb.append(struct.pack('<f', value).hex().upper())
+        if has_curve_type:
+            sb.append(struct.pack('<B', curve_type).hex().upper())
+            
+        return "".join(sb)
+
+# --- 2. Data Model ---
 
 class FloatParameter:
-    """Represents a single 'FloatParams' entry within a clip."""
     def __init__(self, storable, name, value, min_val, max_val):
         self.storable = storable
         self.name = name
@@ -25,26 +52,35 @@ class FloatParameter:
 
     @classmethod
     def from_dict(cls, data):
-        return cls(
-            data.get("Storable"),
-            data.get("Name"),
-            data.get("Value", []),
-            data.get("Min"),
-            data.get("Max")
-        )
+        return cls(data.get("Storable"), data.get("Name"), data.get("Value", []), data.get("Min"), data.get("Max"))
 
     def to_dict(self):
-        return {
-            "Storable": self.storable,
-            "Name": self.name,
-            "Value": self.value,
-            "Min": self.min,
-            "Max": self.max
-        }
+        return {"Storable": self.storable, "Name": self.name, "Value": self.value, "Min": self.min, "Max": self.max}
+
+
+class ControllerTarget:
+    def __init__(self, controller_id, **kwargs):
+        self.id = controller_id
+        self.properties = kwargs
+        # Ensure all curve lists exist
+        for key in ['X', 'Y', 'Z', 'RotX', 'RotY', 'RotZ', 'RotW']:
+            if key not in self.properties:
+                self.properties[key] = []
+
+    @classmethod
+    def from_dict(cls, data):
+        controller_id = data.get("Controller")
+        # All other key-value pairs are stored as properties
+        properties = {k: v for k, v in data.items() if k != "Controller"}
+        return cls(controller_id, **properties)
+
+    def to_dict(self):
+        data = {"Controller": self.id}
+        data.update(self.properties)
+        return data
 
 
 class AnimationClip:
-    """Represents a single animation clip from the 'Clips' list."""
     def __init__(self, name, segment, layer, length, order_index=0, **kwargs):
         self.name = name
         self.segment = segment
@@ -53,23 +89,23 @@ class AnimationClip:
         self.order_index = order_index
         self.other_properties = kwargs
         self.float_params = []
+        self.controllers = [] # <-- Now stores ControllerTarget objects
 
     @classmethod
     def from_dict(cls, data):
-        known_keys = {"AnimationName", "AnimationSegment", "AnimationLayer", "AnimationLength", "FloatParams", "OrderIndex"}
-        clip_name = data.get("AnimationName", "Unnamed")
-        segment = data.get("AnimationSegment", "Default")
-        layer = data.get("AnimationLayer", "Default")
-        length = float(data.get("AnimationLength", 0.0))
-        order_index = int(data.get("OrderIndex", 0))
-
-        other_props = {k: v for k, v in data.items() if k not in known_keys}
-        
-        instance = cls(clip_name, segment, layer, length, order_index, **other_props)
-        
+        known_keys = {"AnimationName", "AnimationSegment", "AnimationLayer", "AnimationLength", "FloatParams", "Controllers", "OrderIndex"}
+        instance = cls(
+            name=data.get("AnimationName", "Unnamed"),
+            segment=data.get("AnimationSegment", "Default"),
+            layer=data.get("AnimationLayer", "Default"),
+            length=float(data.get("AnimationLength", 0.0)),
+            order_index=int(data.get("OrderIndex", 0)),
+            **{k: v for k, v in data.items() if k not in known_keys}
+        )
         if "FloatParams" in data:
             instance.float_params = [FloatParameter.from_dict(p) for p in data["FloatParams"]]
-            
+        if "Controllers" in data:
+            instance.controllers = [ControllerTarget.from_dict(c) for c in data["Controllers"]]
         return instance
 
     def to_dict(self):
@@ -81,13 +117,13 @@ class AnimationClip:
         }
         data.update(self.other_properties)
         if self.float_params:
-            sorted_params = sorted(self.float_params, key=lambda p: p.name)
-            data["FloatParams"] = [p.to_dict() for p in sorted_params]
+            data["FloatParams"] = [p.to_dict() for p in sorted(self.float_params, key=lambda p: p.name)]
+        if self.controllers:
+            data["Controllers"] = [c.to_dict() for c in sorted(self.controllers, key=lambda c: c.id)]
         return data
 
 
 class AnimationFile:
-    """Represents the entire animation file."""
     def __init__(self, version, atom_type):
         self.version = version
         self.atom_type = atom_type
@@ -100,11 +136,9 @@ class AnimationFile:
             for i, clip_data in enumerate(data["Clips"]):
                 clip_data['OrderIndex'] = i
             instance.clips = [AnimationClip.from_dict(c) for c in data["Clips"]]
-        
         return instance
 
     def to_dict(self):
-        # Sort clips before saving to maintain the order from the UI
         self.clips.sort(key=lambda c: c.order_index)
         return {
             "SerializeVersion": self.version,
@@ -112,11 +146,9 @@ class AnimationFile:
             "Clips": [c.to_dict() for c in self.clips]
         }
 
-
-# --- 2. Custom UI Components ---
+# --- 3. Custom UI Components ---
 
 class AnimationTreeWidget(QTreeWidget):
-    """Custom QTreeWidget to handle drag & drop and context menus."""
     def __init__(self, parent_window):
         super().__init__()
         self.parent_window = parent_window
@@ -128,7 +160,6 @@ class AnimationTreeWidget(QTreeWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.open_context_menu)
 
-    # --- FIX START ---
     def dragEnterEvent(self, event):
         if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]:
             event.acceptProposedAction()
@@ -140,7 +171,6 @@ class AnimationTreeWidget(QTreeWidget):
             event.acceptProposedAction()
         else:
             super().dragMoveEvent(event)
-    # --- FIX END ---
             
     def startDrag(self, supportedActions):
         items = self.selectedItems()
@@ -162,7 +192,6 @@ class AnimationTreeWidget(QTreeWidget):
     
     def dropEvent(self, event):
         mime_text = event.mimeData().text()
-        
         if mime_text == "clip-drag":
             self.handle_clip_drop(event)
         elif mime_text == "layer-drag":
@@ -185,23 +214,19 @@ class AnimationTreeWidget(QTreeWidget):
                 target_layer_item = target_item_at_point.parent()
         
         if not target_layer_item or source_layer_item == target_layer_item:
-            event.ignore()
-            return
+            event.ignore(); return
             
         if source_layer_item.parent() != target_layer_item.parent():
             QMessageBox.warning(self, "Invalid Operation", "Layers can only be merged within the same segment.")
             return
 
-        source_name = source_layer_item.text(0).strip()
-        target_name = target_layer_item.text(0).strip()
         reply = QMessageBox.question(self, 'Confirm Layer Merge',
-                                     f"Are you sure you want to merge '{source_name}' into '{target_name}'?\n\n"
-                                     "This will add missing controllers to all animations in the target layer and cannot be undone.",
+                                     f"Are you sure you want to merge '{source_layer_item.text(0).strip()}' into '{target_layer_item.text(0).strip()}'?\n\n"
+                                     "This will add missing targets to all animations and cannot be undone.",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         
         if reply == QMessageBox.StandardButton.No:
-            event.ignore()
-            return
+            event.ignore(); return
 
         segment_name = target_layer_item.parent().text(0).replace("Segment: ", "").strip()
         source_layer_name = source_layer_item.text(0).replace("  Layer: ", "").strip()
@@ -210,39 +235,67 @@ class AnimationTreeWidget(QTreeWidget):
         source_clips = self.get_layer_clips(segment_name, source_layer_name)
         target_clips = self.get_layer_clips(segment_name, target_layer_name)
 
-        all_targets_map = {}
-        for clip in source_clips + target_clips:
-            for param in clip.float_params:
-                param_key = (param.storable, param.name)
-                if param_key not in all_targets_map:
-                    all_targets_map[param_key] = param
+        # 1. Create Master Target Lists for both FloatParams and Controllers
+        master_float_params = { (p.storable, p.name): p for clip in source_clips + target_clips for p in clip.float_params }
+        master_controllers = { c.id: c for clip in source_clips + target_clips for c in clip.controllers }
 
+        # 2. Merge source clips into target layer
         target_clips_by_name = {clip.name: clip for clip in target_clips}
-
         for source_clip in source_clips:
             if source_clip.name in target_clips_by_name:
                 target_clip = target_clips_by_name[source_clip.name]
-                existing_target_keys = {(p.storable, p.name) for p in target_clip.float_params}
+                # Merge float params
+                existing_fp_keys = {(p.storable, p.name) for p in target_clip.float_params}
                 for param in source_clip.float_params:
-                    if (param.storable, param.name) not in existing_target_keys:
+                    if (param.storable, param.name) not in existing_fp_keys:
                         target_clip.float_params.append(param)
+                # Merge controllers
+                existing_controller_ids = {c.id for c in target_clip.controllers}
+                for controller in source_clip.controllers:
+                    if controller.id not in existing_controller_ids:
+                        target_clip.controllers.append(controller)
                 self.parent_window.animation_file.clips.remove(source_clip)
             else:
                 source_clip.layer = target_layer_name
         
+        # 3. Saturate all clips in the merged layer
         final_target_clips = self.get_layer_clips(segment_name, target_layer_name)
-        
         for clip in final_target_clips:
-            clip_target_keys = {(p.storable, p.name) for p in clip.float_params}
-            
-            for target_key, template_param in all_targets_map.items():
-                if target_key not in clip_target_keys:
-                    default_keyframes = [{"t": "0.0", "v": "0.0"}, {"t": str(clip.length), "v": "0.0"}]
+            # Saturate FloatParams
+            clip_fp_keys = {(p.storable, p.name) for p in clip.float_params}
+            for target_key, template_param in master_float_params.items():
+                if target_key not in clip_fp_keys:
+                    kf1 = KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0.0, -1)
+                    kf2 = KeyframeEncoder.encode_keyframe(clip.length, 0.0, 3, 0.0, 3)
                     new_param = FloatParameter(
                         storable=template_param.storable, name=template_param.name,
-                        value=default_keyframes, min_val=template_param.min, max_val=template_param.max
+                        value=[kf1, kf2], min_val=template_param.min, max_val=template_param.max
                     )
                     clip.float_params.append(new_param)
+
+            # Saturate Controllers
+            clip_controller_ids = {c.id for c in clip.controllers}
+            for controller_id, template_controller in master_controllers.items():
+                if controller_id not in clip_controller_ids:
+                    new_controller = ControllerTarget(controller_id, **copy.deepcopy(template_controller.properties))
+                    # Default position (0,0,0) and rotation (0,0,0,1)
+                    pos_val = 0.0
+                    rot_val = 0.0
+                    rotw_val = 1.0
+                    for axis in ['X', 'Y', 'Z']:
+                        kf1 = KeyframeEncoder.encode_keyframe(0.0, pos_val, 3, 0.0, -1)
+                        kf2 = KeyframeEncoder.encode_keyframe(clip.length, pos_val, 3, pos_val, 3)
+                        new_controller.properties[axis] = [kf1, kf2]
+                    for axis in ['RotX', 'RotY', 'RotZ']:
+                        kf1 = KeyframeEncoder.encode_keyframe(0.0, rot_val, 3, 0.0, -1)
+                        kf2 = KeyframeEncoder.encode_keyframe(clip.length, rot_val, 3, rot_val, 3)
+                        new_controller.properties[axis] = [kf1, kf2]
+                    # Special case for RotW
+                    kf1_w = KeyframeEncoder.encode_keyframe(0.0, rotw_val, 3, 0.0, -1)
+                    kf2_w = KeyframeEncoder.encode_keyframe(clip.length, rotw_val, 3, rotw_val, 3)
+                    new_controller.properties['RotW'] = [kf1_w, kf2_w]
+                    
+                    clip.controllers.append(new_controller)
 
         self.parent_window.populate_animation_tree()
         event.acceptProposedAction()
@@ -251,8 +304,7 @@ class AnimationTreeWidget(QTreeWidget):
         source_items = self.selectedItems()
         target_item = self.itemAt(event.position().toPoint())
         if not source_items or not target_item:
-            event.ignore()
-            return
+            event.ignore(); return
 
         is_copy = event.proposedAction() == Qt.DropAction.CopyAction
         source_layer_item = source_items[0].parent()
@@ -264,13 +316,11 @@ class AnimationTreeWidget(QTreeWidget):
             target_layer_item = target_item
         
         if not target_layer_item:
-            event.ignore()
-            return
+            event.ignore(); return
         
         if not is_copy and source_layer_item == target_layer_item:
             segment_name = source_layer_item.parent().text(0).replace("Segment: ", "").strip()
             layer_name = source_layer_item.text(0).replace("  Layer: ", "").strip()
-            
             clips_in_layer = self.get_layer_clips(segment_name, layer_name)
             clips_in_layer.sort(key=lambda c: c.order_index)
 
@@ -465,24 +515,37 @@ class MainWindow(QMainWindow):
         if not self.animation_file:
             return
 
+        expanded_items = {}
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.isExpanded():
+                expanded_items[item.text(0)] = True
+                for j in range(item.childCount()):
+                    child_item = item.child(j)
+                    if child_item.isExpanded():
+                        expanded_items[f"{item.text(0)}/{child_item.text(0)}"] = True
+
+
         grouped_clips = defaultdict(lambda: defaultdict(list))
-        # Sortowanie klipów po order_index zapewnia, że przetwarzamy je w prawidłowej kolejności
-        for clip in sorted(self.animation_file.clips, key=lambda c: c.order_index):
+        for clip in self.animation_file.clips:
             grouped_clips[clip.segment][clip.layer].append(clip)
 
         for segment_name in sorted(grouped_clips.keys()):
             layers = grouped_clips[segment_name]
             segment_item = QTreeWidgetItem(self.tree, [f"Segment: {segment_name}"])
+            if expanded_items.get(segment_item.text(0), True):
+                segment_item.setExpanded(True)
             
             for layer_name in sorted(layers.keys()):
                 clips = layers[layer_name]
                 layer_item = QTreeWidgetItem(segment_item, [f"  Layer: {layer_name}"])
-                
-                for clip_obj in clips: # clips already sorted by order_index
+                if expanded_items.get(f"{segment_item.text(0)}/{layer_item.text(0)}", True):
+                    layer_item.setExpanded(True)
+
+                clips.sort(key=lambda c: c.order_index)
+                for clip_obj in clips:
                     clip_item = QTreeWidgetItem(layer_item, [f"    Clip: {clip_obj.name}"])
                     clip_item.setData(0, 1000, clip_obj)
-        
-        self.tree.expandAll()
         
     def create_new_segment(self):
         if not self.animation_file:

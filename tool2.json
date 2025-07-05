@@ -2941,6 +2941,41 @@
                   "B3333333FA3395DBF",
                   "B000000400E2D61BF"
                ]
+            },
+            {
+               "Controller": "lHandControl",
+               "TargetsPosition": "1",
+               "TargetsRotation": "1",
+               "ControlPosition": "1",
+               "ControlRotation": "1",
+               "X": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "Y": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "Z": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotX": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotY": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotZ": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotW": [
+                  "D000000000000803F03",
+                  "A00000040"
+               ]
             }
          ]
       },
@@ -2961,6 +2996,41 @@
          "Weight": "1",
          "Uninterruptible": "0",
          "Controllers": [
+            {
+               "Controller": "headControl",
+               "TargetsPosition": "1",
+               "TargetsRotation": "1",
+               "ControlPosition": "1",
+               "ControlRotation": "1",
+               "X": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "Y": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "Z": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotX": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotY": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotZ": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotW": [
+                  "D000000000000803F03",
+                  "A00000040"
+               ]
+            },
             {
                "Controller": "lHandControl",
                "TargetsPosition": "1",
@@ -3022,6 +3092,41 @@
          "Weight": "1",
          "Uninterruptible": "0",
          "Controllers": [
+            {
+               "Controller": "headControl",
+               "TargetsPosition": "1",
+               "TargetsRotation": "1",
+               "ControlPosition": "1",
+               "ControlRotation": "1",
+               "X": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "Y": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "Z": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotX": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotY": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotZ": [
+                  "C0000000003",
+                  "A00000040"
+               ],
+               "RotW": [
+                  "D000000000000803F03",
+                  "A00000040"
+               ]
+            },
             {
                "Controller": "lHandControl",
                "TargetsPosition": "1",
