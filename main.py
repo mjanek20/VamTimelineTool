@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QFileDialog, QLabel,
     QMenu, QMessageBox, QInputDialog, QToolBar, QFormLayout, QLineEdit,
-    QListWidget, QPlainTextEdit, QPushButton, QDialog, QDialogButtonBox
+    QListWidget, QPlainTextEdit, QPushButton, QDialog, QDialogButtonBox,
+    QRadioButton
 )
 
 # --- 1. Keyframe Encoding Logic ---
@@ -230,8 +231,8 @@ class AnimationTreeWidget(QTreeWidget):
     def get_layer_clips(self, segment_name, layer_name):
         return [c for c in self.parent_window.animation_file.clips if c.segment == segment_name and c.layer == layer_name]
 
-    def get_layer_target_signature(self, segment_name, layer_name):
-        clips = self.get_layer_clips(segment_name, layer_name)
+    def get_layer_target_signature(self, segment_name, layer_name, anim_file):
+        clips = [c for c in anim_file.clips if c.segment == segment_name and c.layer == layer_name]
         if not clips: return frozenset(), frozenset()
         
         float_params_keys = {(p.storable, p.name) for c in clips for p in c.float_params}
@@ -406,7 +407,7 @@ class AnimationTreeWidget(QTreeWidget):
         target_segment_item = target_layer_item.parent()
         target_segment_name = target_segment_item.text(0).replace("Segment: ", "").strip()
 
-        source_fp_sig, source_c_sig = self.get_layer_target_signature(source_segment_name, source_layer_name)
+        source_fp_sig, source_c_sig = self.parent_window.tree.get_layer_target_signature(source_segment_name, source_layer_name, self.parent_window.animation_file)
         
         # If moving to a different segment, check for a compatible layer or create a new one
         if source_segment_name != target_segment_name:
@@ -414,7 +415,7 @@ class AnimationTreeWidget(QTreeWidget):
             for i in range(target_segment_item.childCount()):
                 layer_item = target_segment_item.child(i)
                 layer_name = layer_item.text(0).replace("  Layer: ", "").strip()
-                fp_sig, c_sig = self.get_layer_target_signature(target_segment_name, layer_name)
+                fp_sig, c_sig = self.parent_window.tree.get_layer_target_signature(target_segment_name, layer_name, self.parent_window.animation_file)
                 if fp_sig == source_fp_sig and c_sig == source_c_sig:
                     compatible_layer_name = layer_name
                     break
@@ -587,12 +588,12 @@ class ClipPropertiesPanel(QWidget):
         self.current_tree_item = None
         self.hide()
 
-
 # --- 4. Main Application Window ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.animation_file = None
+        self.current_file_path = None
         self.setWindowTitle("VamTimeline Animation Editor")
         self.setGeometry(100, 100, 1200, 800)
         self.init_ui()
@@ -764,64 +765,200 @@ class MainWindow(QMainWindow):
         search_text = text.lower()
         is_filtering = bool(search_text)
         
-        for i in range(self.tree.topLevelItemCount()):
-            segment_item = self.tree.topLevelItem(i)
-            segment_visible = False
-            for j in range(segment_item.childCount()):
-                layer_item = segment_item.child(j)
-                layer_visible = False
-                for k in range(layer_item.childCount()):
-                    clip_item = layer_item.child(k)
-                    if search_text in clip_item.text(0).lower():
-                        clip_item.setHidden(False)
-                        layer_visible = True
-                    else:
-                        clip_item.setHidden(True)
-                
-                if layer_visible or search_text in layer_item.text(0).lower():
-                    layer_item.setHidden(False)
-                    segment_visible = True
-                    if is_filtering:
-                        layer_item.setExpanded(True)
-                else:
-                    layer_item.setHidden(True)
+        # Don't do anything if the tree is empty
+        if self.tree.topLevelItemCount() == 0:
+            return
 
-            if segment_visible or search_text in segment_item.text(0).lower():
-                segment_item.setHidden(False)
-                if is_filtering:
+        # When filtering, expand matching nodes.
+        if is_filtering:
+            for i in range(self.tree.topLevelItemCount()):
+                segment_item = self.tree.topLevelItem(i)
+                segment_visible = False
+                for j in range(segment_item.childCount()):
+                    layer_item = segment_item.child(j)
+                    layer_visible = False
+                    for k in range(layer_item.childCount()):
+                        clip_item = layer_item.child(k)
+                        if search_text in clip_item.text(0).lower():
+                            clip_item.setHidden(False)
+                            layer_visible = True
+                        else:
+                            clip_item.setHidden(True)
+                    
+                    if layer_visible or search_text in layer_item.text(0).lower():
+                        layer_item.setHidden(False)
+                        segment_visible = True
+                        layer_item.setExpanded(True)
+                    else:
+                        layer_item.setHidden(True)
+
+                if segment_visible or search_text in segment_item.text(0).lower():
+                    segment_item.setHidden(False)
                     segment_item.setExpanded(True)
-            else:
-                segment_item.setHidden(True)
-        
-        if not is_filtering:
-            # If filter is cleared, repopulate to restore the original collapse state
+                else:
+                    segment_item.setHidden(True)
+        else:
+            # When filter is cleared, restore visibility and saved collapse state.
             self.populate_animation_tree()
 
     def open_file(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Open Animation File", "", "JSON Files (*.json)")
-        if file_name:
-            try:
-                with open(file_name, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                self.animation_file = AnimationFile.from_dict(data)
-                self.populate_animation_tree(is_first_load=True)
-                self.setWindowTitle(f"VamTimeline Animation Editor - {file_name}")
-                self.log_message(f"File opened: {file_name}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Error loading file: {e}")
-                self.log_message(f"ERROR: Failed to load file. Reason: {e}")
+        if not file_name:
+            return
+
+        if self.animation_file:
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Icon.Question)
+            msg_box.setText("An animation file is already open.")
+            msg_box.setInformativeText("How would you like to open the new file?")
+            merge_button = msg_box.addButton("Merge", QMessageBox.ButtonRole.ActionRole)
+            replace_button = msg_box.addButton("Replace", QMessageBox.ButtonRole.ActionRole)
+            msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg_box.exec()
+
+            if msg_box.clickedButton() == merge_button:
+                self.merge_animation_files(file_name)
+            elif msg_box.clickedButton() == replace_button:
+                self.load_file(file_name, is_first_load=True)
+            else: # Cancel
+                return
+        else:
+            self.load_file(file_name, is_first_load=True)
+            
+    def load_file(self, file_name, is_first_load=False):
+        try:
+            with open(file_name, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.animation_file = AnimationFile.from_dict(data)
+            self.current_file_path = file_name
+            self.populate_animation_tree(is_first_load=is_first_load)
+            self.setWindowTitle(f"VamTimeline Animation Editor - {file_name}")
+            self.log_message(f"File loaded: {file_name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error loading file: {e}")
+            self.log_message(f"ERROR: Failed to load file '{file_name}'. Reason: {e}")
+            self.animation_file = None
+            self.current_file_path = None
+            self.tree.clear()
+
+    def merge_animation_files(self, source_file_path):
+        self.log_message(f"Attempting to merge file: {source_file_path}")
+        try:
+            with open(source_file_path, 'r', encoding='utf-8') as f:
+                source_data = json.load(f)
+            source_anim_file = AnimationFile.from_dict(source_data)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not read the source file for merging: {e}")
+            self.log_message(f"ERROR: Merge failed. Could not read source file. Reason: {e}")
+            return
+
+        # --- 1. Validate compatibility ---
+        if self.animation_file.atom_type != source_anim_file.atom_type:
+            QMessageBox.critical(self, "Merge Error", f"Cannot merge files with different Atom Types.\n\nCurrent: {self.animation_file.atom_type}\nSource: {source_anim_file.atom_type}")
+            self.log_message("ERROR: Merge failed. Mismatched AtomType.")
+            return
+
+        # --- 2. Ask user how to handle conflicts ---
+        conflict_dialog = MergeConflictDialog(self)
+        if not conflict_dialog.exec():
+            self.log_message("Merge cancelled by user.")
+            return
+        conflict_strategy = conflict_dialog.get_selected_strategy()
+
+        # --- 3. Perform the merge ---
+        self.log_message(f"Starting merge with conflict strategy: {conflict_strategy}")
+        added_clips_count = 0
+        
+        # Group source clips for easier processing
+        source_grouped_clips = defaultdict(lambda: defaultdict(list))
+        for clip in source_anim_file.clips:
+            source_grouped_clips[clip.segment][clip.layer].append(clip)
+            
+        max_order_index = max((c.order_index for c in self.animation_file.clips), default=-1)
+
+        for segment_name, layers in source_grouped_clips.items():
+            for layer_name, source_clips in layers.items():
+                source_fp_sig, source_c_sig = self.tree.get_layer_target_signature(segment_name, layer_name, source_anim_file)
+                
+                # Find compatible target layer
+                target_segment_name = segment_name
+                target_layer_name = layer_name
+                
+                # Check for existing compatible layer in target file
+                target_layers_in_segment = {c.layer for c in self.animation_file.clips if c.segment == target_segment_name}
+                compatible_layer_found = False
+                for existing_layer_name in target_layers_in_segment:
+                    fp_sig, c_sig = self.tree.get_layer_target_signature(target_segment_name, existing_layer_name, self.animation_file)
+                    if fp_sig == source_fp_sig and c_sig == source_c_sig:
+                        target_layer_name = existing_layer_name
+                        compatible_layer_found = True
+                        break
+                
+                if not compatible_layer_found:
+                    # No compatible layer, create a new one. Ensure unique name.
+                    counter = 1
+                    new_layer_name = layer_name
+                    while new_layer_name in target_layers_in_segment:
+                        new_layer_name = f"{layer_name}_{counter}"
+                        counter += 1
+                    target_layer_name = new_layer_name
+                    self.log_message(f"Created new layer '{target_layer_name}' in segment '{target_segment_name}' for merged clips.")
+
+                # Get existing names in the final target layer
+                existing_names_in_target_layer = {c.name for c in self.animation_file.clips if c.segment == target_segment_name and c.layer == target_layer_name}
+
+                for source_clip in source_clips:
+                    is_conflict = source_clip.name in existing_names_in_target_layer
+                    
+                    if is_conflict and conflict_strategy == "skip":
+                        self.log_message(f"Skipping clip '{source_clip.name}' due to name conflict.")
+                        continue
+                        
+                    new_clip = copy.deepcopy(source_clip)
+                    new_clip.segment = target_segment_name
+                    new_clip.layer = target_layer_name
+                    
+                    if is_conflict and conflict_strategy == "replace":
+                        # Remove the old clip
+                        clip_to_remove = next(c for c in self.animation_file.clips if c.segment == target_segment_name and c.layer == target_layer_name and c.name == source_clip.name)
+                        self.animation_file.clips.remove(clip_to_remove)
+                        self.log_message(f"Replacing clip '{source_clip.name}' in '{target_segment_name}/{target_layer_name}'.")
+                    elif is_conflict and conflict_strategy == "rename":
+                        base_name = source_clip.name
+                        counter = 1
+                        new_name = f"{base_name}_merged"
+                        while new_name in existing_names_in_target_layer:
+                             new_name = f"{base_name}_merged_{counter}"
+                             counter += 1
+                        new_clip.name = new_name
+                        self.log_message(f"Renaming conflicting clip '{source_clip.name}' to '{new_clip.name}'.")
+                    
+                    max_order_index += 1
+                    new_clip.order_index = max_order_index
+                    self.animation_file.clips.append(new_clip)
+                    existing_names_in_target_layer.add(new_clip.name)
+                    added_clips_count += 1
+        
+        self.log_message(f"Merge complete. Added {added_clips_count} clip(s) to the project.")
+        # Mark the current file as unsaved by clearing the path
+        if self.current_file_path:
+            self.setWindowTitle(self.windowTitle() + " *")
+            self.current_file_path = None
+        
+        self.populate_animation_tree()
 
     def save_file_as(self):
         if not self.animation_file: 
             self.log_message("Save cancelled: No animation data loaded.")
             return
-        file_name, _ = QFileDialog.getSaveFileName(self, "Save Animation File As", "", "JSON Files (*.json)")
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Animation File As", self.current_file_path or "", "JSON Files (*.json)")
         if file_name:
             if not file_name.lower().endswith('.json'):
                 file_name += '.json'
             try:
                 with open(file_name, 'w', encoding='utf-8') as f:
                     json.dump(self.animation_file.to_dict(), f, indent=3, ensure_ascii=False)
+                self.current_file_path = file_name
                 self.setWindowTitle(f"VamTimeline Animation Editor - {file_name}")
                 self.log_message(f"File saved as: {file_name}")
             except Exception as e:
@@ -865,8 +1002,6 @@ class MainWindow(QMainWindow):
                     clip_item.setFlags(clip_item.flags() | Qt.ItemFlag.ItemIsEditable)
         
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
-        # We don't call filter_tree here anymore to prevent collapse state override
-        # The filter is reapplied when text changes or cleared.
 
     def create_new_segment(self):
         if not self.animation_file: 
@@ -1008,8 +1143,6 @@ class MainWindow(QMainWindow):
         old_name = clip.name
         new_name = new_name_raw.strip()
         
-        # This function might be called from the properties panel
-        # To avoid re-triggering, block signals on the editor if it's focused
         editor = self.properties_panel.name_edit
         was_blocked = editor.signalsBlocked()
         editor.blockSignals(True)
@@ -1049,7 +1182,6 @@ class MainWindow(QMainWindow):
         clip_obj = item.data(0, 1000)
         if not isinstance(clip_obj, AnimationClip): return
 
-        # Find a unique name for the copy
         base_name = clip_obj.name
         new_name = f"{base_name} (copy)"
         layer_clips = [c for c in self.animation_file.clips if c.segment == clip_obj.segment and c.layer == clip_obj.layer]
@@ -1094,7 +1226,6 @@ class MainWindow(QMainWindow):
                     new_name = new_name + suffix
                     
                 if new_name != original_name:
-                    # Check for conflicts
                     is_conflict = any(c.name == new_name and c.layer == clip.layer and c.segment == clip.segment
                                     for c in self.animation_file.clips if c is not clip)
                     if is_conflict:
@@ -1102,7 +1233,6 @@ class MainWindow(QMainWindow):
                         continue
                     
                     clip.name = new_name
-                    # Also update references
                     for other_clip in self.animation_file.clips:
                         if other_clip.other_properties.get("NextAnimationName") == original_name and \
                            other_clip.layer == clip.layer and other_clip.segment == clip.segment:
@@ -1112,6 +1242,35 @@ class MainWindow(QMainWindow):
             
             self.log_message(f"Batch renamed {renamed_count} clip(s).")
             self.populate_animation_tree()
+
+class MergeConflictDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Merge Clip Name Conflicts")
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("How should clips with conflicting names be handled?"))
+
+        self.rename_radio = QRadioButton("Rename and Add (e.g., 'Clip_merged')")
+        self.rename_radio.setChecked(True)
+        self.replace_radio = QRadioButton("Replace Existing Clips")
+        self.skip_radio = QRadioButton("Skip Conflicting Clips")
+
+        layout.addWidget(self.rename_radio)
+        layout.addWidget(self.replace_radio)
+        layout.addWidget(self.skip_radio)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_selected_strategy(self):
+        if self.replace_radio.isChecked():
+            return "replace"
+        if self.skip_radio.isChecked():
+            return "skip"
+        return "rename" # Default
 
 class BatchRenameDialog(QDialog):
     def __init__(self, parent=None):
