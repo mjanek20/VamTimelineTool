@@ -163,6 +163,14 @@ class AnimationTreeWidget(QTreeWidget):
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.open_context_menu)
+        
+        # --- Style for better selection visibility ---
+        self.setStyleSheet("""
+            QTreeWidget::item:selected {
+                background-color: #a8d8ff;
+                color: black;
+            }
+        """)
 
     def dragEnterEvent(self, event):
         if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]:
@@ -374,7 +382,7 @@ class AnimationTreeWidget(QTreeWidget):
         for i, clip_obj in enumerate(remaining_clips):
             clip_obj.order_index = i
         
-        clip_names_str = ", ".join(c.name for c in dragged_clip_objs)
+        clip_names_str = ", ".join(f"'{c.name}'" for c in dragged_clip_objs)
         self.parent_window.log_message(f"Reordered {len(dragged_clip_objs)} clip(s) within layer '{layer_name}' (Segment: '{segment_name}'): {clip_names_str}.")
 
     def move_or_copy_clips_to_layer(self, source_items, target_layer_item, is_copy, event):
@@ -439,7 +447,6 @@ class AnimationTreeWidget(QTreeWidget):
                 self.parent_window.animation_file.clips.append(new_clip_obj)
                 existing_names_in_target.add(new_name)
                 self.parent_window.log_message(f"Copied clip '{source_clip_obj.name}' to '{target_segment_name}/{target_layer_name}'.")
-
             else:
                 self.parent_window.log_message(f"Moved clip '{source_clip_obj.name}' from '{source_segment_name}/{source_layer_name}' to '{target_segment_name}/{target_layer_name}'.")
                 source_clip_obj.name = new_name
@@ -447,7 +454,6 @@ class AnimationTreeWidget(QTreeWidget):
                 source_clip_obj.layer = target_layer_name
                 source_clip_obj.order_index = max_order_index
         
-
     def open_context_menu(self, position):
         menu = QMenu(self)
         selected_items = self.selectedItems()
@@ -638,11 +644,15 @@ class MainWindow(QMainWindow):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_panel.setFixedWidth(400)
+
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Filter animations...")
+        self.filter_edit.textChanged.connect(self.filter_tree)
+        left_layout.addWidget(self.filter_edit)
         
         self.tree = AnimationTreeWidget(self)
         self.tree.setHeaderLabels(["Segment / Layer / Animation"])
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
-        left_layout.addWidget(QLabel("Animation Structure:"))
         left_layout.addWidget(self.tree)
         
         # Right Panel (Properties and Log)
@@ -689,6 +699,39 @@ class MainWindow(QMainWindow):
         else:
             self.properties_panel.clear()
             self.placeholder_label.show()
+
+    def filter_tree(self, text):
+        """Filters the tree based on the input text."""
+        search_text = text.lower()
+        
+        # Iterate over all items and hide/show them
+        for i in range(self.tree.topLevelItemCount()):
+            segment_item = self.tree.topLevelItem(i)
+            segment_visible = False
+            for j in range(segment_item.childCount()):
+                layer_item = segment_item.child(j)
+                layer_visible = False
+                for k in range(layer_item.childCount()):
+                    clip_item = layer_item.child(k)
+                    # Check if the clip name contains the search text
+                    if search_text in clip_item.text(0).lower():
+                        clip_item.setHidden(False)
+                        layer_visible = True
+                    else:
+                        clip_item.setHidden(True)
+                
+                # If any clip in the layer is visible, the layer must be visible
+                if layer_visible or search_text in layer_item.text(0).lower():
+                    layer_item.setHidden(False)
+                    segment_visible = True
+                else:
+                    layer_item.setHidden(True)
+
+            # If any layer in the segment is visible, the segment must be visible
+            if segment_visible or search_text in segment_item.text(0).lower():
+                segment_item.setHidden(False)
+            else:
+                segment_item.setHidden(True)
 
     def open_file(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Open Animation File", "", "JSON Files (*.json)")
@@ -790,7 +833,7 @@ class MainWindow(QMainWindow):
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self.animation_file.clips = [c for c in self.animation_file.clips if c not in clips_to_delete]
-            self.log_message(f"Deleted {len(clip_names)} clip(s): {', '.join(clip_names)}.")
+            self.log_message(f"Deleted {len(clip_names)} clip(s): {', '.join(f'\'{n}\'' for n in clip_names)}.")
             self.populate_animation_tree()
 
 # --- 5. Application Entry Point ---
