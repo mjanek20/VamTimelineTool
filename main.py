@@ -13,7 +13,6 @@ from PyQt6.QtWidgets import (
 )
 
 # --- 1. Data Model ---
-# (Bez zmian w tej sekcji, poza dodaniem OrderIndex, które już było)
 
 class FloatParameter:
     """Represents a single 'FloatParams' entry within a clip."""
@@ -79,11 +78,11 @@ class AnimationClip:
             "AnimationSegment": self.segment,
             "AnimationLayer": self.layer,
             "AnimationLength": str(self.length),
-            "OrderIndex": self.order_index,
         }
         data.update(self.other_properties)
         if self.float_params:
-            data["FloatParams"] = [p.to_dict() for p in self.float_params]
+            sorted_params = sorted(self.float_params, key=lambda p: p.name)
+            data["FloatParams"] = [p.to_dict() for p in sorted_params]
         return data
 
 
@@ -98,22 +97,15 @@ class AnimationFile:
     def from_dict(cls, data):
         instance = cls(data.get("SerializeVersion"), data.get("AtomType"))
         if "Clips" in data:
+            for i, clip_data in enumerate(data["Clips"]):
+                clip_data['OrderIndex'] = i
             instance.clips = [AnimationClip.from_dict(c) for c in data["Clips"]]
         
-        grouped_for_indexing = defaultdict(list)
-        for clip in instance.clips:
-            grouped_for_indexing[(clip.segment, clip.layer)].append(clip)
-        
-        for key in grouped_for_indexing:
-            if any(c.order_index for c in grouped_for_indexing[key]):
-                continue
-            for i, clip in enumerate(grouped_for_indexing[key]):
-                clip.order_index = i
-
         return instance
 
     def to_dict(self):
-        self.clips.sort(key=lambda c: (c.segment, c.layer, c.order_index))
+        # Sort clips before saving to maintain the order from the UI
+        self.clips.sort(key=lambda c: c.order_index)
         return {
             "SerializeVersion": self.version,
             "AtomType": self.atom_type,
@@ -136,36 +128,34 @@ class AnimationTreeWidget(QTreeWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.open_context_menu)
 
+    # --- FIX START ---
     def dragEnterEvent(self, event):
-        if event.source() == self and event.mimeData().hasText():
-            if event.mimeData().text() in ["clip-drag", "layer-drag"]:
-                event.acceptProposedAction()
-                return
-        super().dragEnterEvent(event)
+        if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]:
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
-        if event.source() == self and event.mimeData().hasText():
-             if event.mimeData().text() in ["clip-drag", "layer-drag"]:
-                event.acceptProposedAction()
-                return
-        super().dragMoveEvent(event)
-
+        if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]:
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+    # --- FIX END ---
+            
     def startDrag(self, supportedActions):
         items = self.selectedItems()
         if not items: return
         
-        item = items[0] # Bierzemy pierwszy zaznaczony element do określenia typu
+        item = items[0]
         drag = QDrag(self)
         mime_data = QMimeData()
         
-        # --- ZMIANA: Rozróżnienie przeciągania warstwy od klipu ---
-        if item.parent() and not item.parent().parent():  # To jest element warstwy
-            if len(items) > 1: return # Zablokuj przeciąganie wielu warstw naraz
+        if item.parent() and not item.parent().parent():
+            if len(items) > 1: return
             mime_data.setText("layer-drag")
-            # Dla warstw dozwolone jest tylko przenoszenie (łączenie)
             drag.setMimeData(mime_data)
             drag.exec(Qt.DropAction.MoveAction)
-        elif item.parent() and item.parent().parent(): # To jest element klipu
+        elif item.parent() and item.parent().parent():
             mime_data.setText("clip-drag")
             drag.setMimeData(mime_data)
             drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction, Qt.DropAction.MoveAction)
@@ -179,79 +169,80 @@ class AnimationTreeWidget(QTreeWidget):
             self.handle_layer_merge(event)
         else:
             event.ignore()
+            
+    def get_layer_clips(self, segment_name, layer_name):
+        return [c for c in self.parent_window.animation_file.clips if c.segment == segment_name and c.layer == layer_name]
 
     def handle_layer_merge(self, event):
         source_layer_item = self.selectedItems()[0]
         target_item_at_point = self.itemAt(event.position().toPoint())
-        if not target_item_at_point:
+        
+        target_layer_item = None
+        if target_item_at_point:
+            if target_item_at_point.parent() and not target_item_at_point.parent().parent():
+                target_layer_item = target_item_at_point
+            elif target_item_at_point.parent() and target_item_at_point.parent().parent():
+                target_layer_item = target_item_at_point.parent()
+        
+        if not target_layer_item or source_layer_item == target_layer_item:
             event.ignore()
             return
             
-        # Znajdź docelowy element warstwy
-        target_layer_item = None
-        if target_item_at_point.parent() and not target_item_at_point.parent().parent():
-            target_layer_item = target_item_at_point
-        elif target_item_at_point.parent() and target_item_at_point.parent().parent():
-            target_layer_item = target_item_at_point.parent()
-        
-        if not target_layer_item:
-            event.ignore()
-            return
-
-        # Walidacja
-        if source_layer_item == target_layer_item: return # Nie można upuścić na siebie
         if source_layer_item.parent() != target_layer_item.parent():
             QMessageBox.warning(self, "Invalid Operation", "Layers can only be merged within the same segment.")
             return
 
-        # Dialog potwierdzający
         source_name = source_layer_item.text(0).strip()
         target_name = target_layer_item.text(0).strip()
         reply = QMessageBox.question(self, 'Confirm Layer Merge',
                                      f"Are you sure you want to merge '{source_name}' into '{target_name}'?\n\n"
-                                     "This will move all animations and cannot be undone.",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                     QMessageBox.StandardButton.No)
+                                     "This will add missing controllers to all animations in the target layer and cannot be undone.",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        
         if reply == QMessageBox.StandardButton.No:
             event.ignore()
             return
 
-        # Logika łączenia
-        target_segment_name = target_layer_item.parent().text(0).replace("Segment: ", "").strip()
+        segment_name = target_layer_item.parent().text(0).replace("Segment: ", "").strip()
         source_layer_name = source_layer_item.text(0).replace("  Layer: ", "").strip()
         target_layer_name = target_layer_item.text(0).replace("  Layer: ", "").strip()
 
-        source_clips = [c for c in self.parent_window.animation_file.clips if c.segment == target_segment_name and c.layer == source_layer_name]
-        target_clips = [c for c in self.parent_window.animation_file.clips if c.segment == target_segment_name and c.layer == target_layer_name]
-        target_clip_names = {c.name: c for c in target_clips}
+        source_clips = self.get_layer_clips(segment_name, source_layer_name)
+        target_clips = self.get_layer_clips(segment_name, target_layer_name)
 
-        max_order_index = -1
-        if target_clips:
-            max_order_index = max(c.order_index for c in target_clips)
+        all_targets_map = {}
+        for clip in source_clips + target_clips:
+            for param in clip.float_params:
+                param_key = (param.storable, param.name)
+                if param_key not in all_targets_map:
+                    all_targets_map[param_key] = param
+
+        target_clips_by_name = {clip.name: clip for clip in target_clips}
 
         for source_clip in source_clips:
-            if source_clip.name in target_clip_names:
-                # Obsługa konfliktu nazw
-                msg_box = QMessageBox(self.parent_window)
-                msg_box.setWindowTitle("Clip Name Conflict")
-                msg_box.setText(f"A clip named '{source_clip.name}' exists in both layers.")
-                msg_box.setInformativeText("How should the controllers (FloatParams) be handled?")
-                replace_button = msg_box.addButton("Merge and Replace", QMessageBox.ButtonRole.YesRole)
-                skip_button = msg_box.addButton("Skip This Clip", QMessageBox.ButtonRole.RejectRole)
-                msg_box.exec()
-
-                if msg_box.clickedButton() == replace_button:
-                    # Połącz parametry i usuń stary klip
-                    target_clip = target_clip_names[source_clip.name]
-                    target_clip.float_params.extend(source_clip.float_params)
-                    self.parent_window.animation_file.clips.remove(source_clip)
-                else: # Skip
-                    continue
+            if source_clip.name in target_clips_by_name:
+                target_clip = target_clips_by_name[source_clip.name]
+                existing_target_keys = {(p.storable, p.name) for p in target_clip.float_params}
+                for param in source_clip.float_params:
+                    if (param.storable, param.name) not in existing_target_keys:
+                        target_clip.float_params.append(param)
+                self.parent_window.animation_file.clips.remove(source_clip)
             else:
-                # Brak konfliktu, po prostu przenieś
-                max_order_index += 1
                 source_clip.layer = target_layer_name
-                source_clip.order_index = max_order_index
+        
+        final_target_clips = self.get_layer_clips(segment_name, target_layer_name)
+        
+        for clip in final_target_clips:
+            clip_target_keys = {(p.storable, p.name) for p in clip.float_params}
+            
+            for target_key, template_param in all_targets_map.items():
+                if target_key not in clip_target_keys:
+                    default_keyframes = [{"t": "0.0", "v": "0.0"}, {"t": str(clip.length), "v": "0.0"}]
+                    new_param = FloatParameter(
+                        storable=template_param.storable, name=template_param.name,
+                        value=default_keyframes, min_val=template_param.min, max_val=template_param.max
+                    )
+                    clip.float_params.append(new_param)
 
         self.parent_window.populate_animation_tree()
         event.acceptProposedAction()
@@ -279,23 +270,21 @@ class AnimationTreeWidget(QTreeWidget):
         if not is_copy and source_layer_item == target_layer_item:
             segment_name = source_layer_item.parent().text(0).replace("Segment: ", "").strip()
             layer_name = source_layer_item.text(0).replace("  Layer: ", "").strip()
-            clips_in_layer = [c for c in self.parent_window.animation_file.clips if c.segment == segment_name and c.layer == layer_name]
+            
+            clips_in_layer = self.get_layer_clips(segment_name, layer_name)
             clips_in_layer.sort(key=lambda c: c.order_index)
+
             dragged_clip_objs = [item.data(0, 1000) for item in source_items]
             remaining_clips = [clip for clip in clips_in_layer if clip not in dragged_clip_objs]
             
-            drop_pos = self.dropIndicatorPosition()
-            target_index = -1
+            drop_pos_indicator = self.dropIndicatorPosition()
+            target_clip_obj = target_item.data(0, 1000) if isinstance(target_item.data(0, 1000), AnimationClip) else None
 
-            if isinstance(target_item.data(0, 1000), AnimationClip):
-                target_clip_obj = target_item.data(0, 1000)
-                try:
-                    target_index = remaining_clips.index(target_clip_obj)
-                    if drop_pos == QAbstractItemView.DropIndicatorPosition.BelowItem: target_index += 1
-                except ValueError: 
-                    event.ignore()
-                    return
-            else: 
+            if target_clip_obj and target_clip_obj in remaining_clips:
+                target_index = remaining_clips.index(target_clip_obj)
+                if drop_pos_indicator == QAbstractItemView.DropIndicatorPosition.BelowItem:
+                    target_index += 1
+            else:
                 target_index = len(remaining_clips)
                 
             for clip_obj in reversed(dragged_clip_objs):
@@ -314,8 +303,9 @@ class AnimationTreeWidget(QTreeWidget):
         target_layer_name = target_layer_item.text(0).replace("  Layer: ", "").strip()
         target_segment_name = target_layer_item.parent().text(0).replace("Segment: ", "").strip()
         
-        clips_in_target_layer = [c for c in self.parent_window.animation_file.clips if c.segment == target_segment_name and c.layer == target_layer_name]
+        clips_in_target_layer = self.get_layer_clips(target_segment_name, target_layer_name)
         existing_names_in_target = {c.name for c in clips_in_target_layer}
+        
         max_order_index = -1
         if clips_in_target_layer:
             max_order_index = max(c.order_index for c in clips_in_target_layer)
@@ -325,7 +315,7 @@ class AnimationTreeWidget(QTreeWidget):
             new_name = source_clip_obj.name
             
             if new_name in existing_names_in_target:
-                msg_box = QMessageBox(self.parent_window)
+                msg_box = QMessageBox(self)
                 msg_box.setWindowTitle("Name Conflict")
                 msg_box.setText(f"A clip named '{new_name}' already exists in the target layer.")
                 replace_button = msg_box.addButton("Replace", QMessageBox.ButtonRole.YesRole)
@@ -376,7 +366,7 @@ class AnimationTreeWidget(QTreeWidget):
         action = menu.exec(self.viewport().mapToGlobal(position))
         if action == new_segment_action: self.parent_window.create_new_segment()
 
-# --- 3. Main Application Window ---
+# --- 4. Main Application Window ---
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -476,17 +466,19 @@ class MainWindow(QMainWindow):
             return
 
         grouped_clips = defaultdict(lambda: defaultdict(list))
-        for clip in self.animation_file.clips:
+        # Sortowanie klipów po order_index zapewnia, że przetwarzamy je w prawidłowej kolejności
+        for clip in sorted(self.animation_file.clips, key=lambda c: c.order_index):
             grouped_clips[clip.segment][clip.layer].append(clip)
 
-        for segment_name, layers in sorted(grouped_clips.items()):
+        for segment_name in sorted(grouped_clips.keys()):
+            layers = grouped_clips[segment_name]
             segment_item = QTreeWidgetItem(self.tree, [f"Segment: {segment_name}"])
             
-            for layer_name, clips in sorted(layers.items()):
+            for layer_name in sorted(layers.keys()):
+                clips = layers[layer_name]
                 layer_item = QTreeWidgetItem(segment_item, [f"  Layer: {layer_name}"])
                 
-                # --- ZMIANA: Sortowanie po order_index ---
-                for clip_obj in sorted(clips, key=lambda c: c.order_index):
+                for clip_obj in clips: # clips already sorted by order_index
                     clip_item = QTreeWidgetItem(layer_item, [f"    Clip: {clip_obj.name}"])
                     clip_item.setData(0, 1000, clip_obj)
         
@@ -500,7 +492,8 @@ class MainWindow(QMainWindow):
         text, ok = QInputDialog.getText(self, 'New Segment', 'Enter a name for the new segment:')
 
         if ok and text:
-            new_clip = AnimationClip(name="New Animation", segment=text, layer="Main", length=1.0, order_index=0)
+            max_order = max(c.order_index for c in self.animation_file.clips) if self.animation_file.clips else -1
+            new_clip = AnimationClip(name="New Animation", segment=text, layer="Main", length=1.0, order_index=max_order + 1)
             self.animation_file.clips.append(new_clip)
             self.populate_animation_tree()
 
@@ -532,7 +525,7 @@ class MainWindow(QMainWindow):
             self.populate_animation_tree()
 
 
-# --- 4. Application Entry Point ---
+# --- 5. Application Entry Point ---
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = MainWindow()
