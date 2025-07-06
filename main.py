@@ -1,11 +1,12 @@
 import sys
+import os
 import json
 import copy
 import struct
 from collections import defaultdict
 
 # Using PyQt6 for the GUI
-from PyQt6.QtCore import Qt, QMimeData, QDateTime
+from PyQt6.QtCore import Qt, QMimeData, QDateTime, QSettings
 from PyQt6.QtGui import QAction, QIcon, QDrag
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -594,8 +595,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.animation_file = None
         self.current_file_path = None
-        self.setWindowTitle("VamTimeline Animation Editor")
+        self.setWindowTitle("Timeliner")
+        ico_path = os.path.join(getattr(sys, '_MEIPASS', os.path.abspath('.')), 'Timeliner.ico')
+        self.setWindowIcon(QIcon(ico_path))
         self.setGeometry(100, 100, 1200, 800)
+
+        # --- Load settings ---
+        self.settings = QSettings("VamTimelineTools", "TimelinerEditor")
+        self.last_directory = self.settings.value("last_directory", "")
+
         self.init_ui()
 
     def init_ui(self):
@@ -802,7 +810,7 @@ class MainWindow(QMainWindow):
             self.populate_animation_tree()
 
     def open_file(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Open Animation File", "", "JSON Files (*.json)")
+        file_name, _ = QFileDialog.getOpenFileName(self, "Open Animation File", self.last_directory, "JSON Files (*.json)")
         if not file_name:
             return
 
@@ -832,8 +840,13 @@ class MainWindow(QMainWindow):
             self.animation_file = AnimationFile.from_dict(data)
             self.current_file_path = file_name
             self.populate_animation_tree(is_first_load=is_first_load)
-            self.setWindowTitle(f"VamTimeline Animation Editor - {file_name}")
+            self.setWindowTitle(f"Timeliner - {file_name}")
             self.log_message(f"File loaded: {file_name}")
+            
+            # --- Remember last directory ---
+            self.last_directory = os.path.dirname(file_name)
+            self.settings.setValue("last_directory", self.last_directory)
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error loading file: {e}")
             self.log_message(f"ERROR: Failed to load file '{file_name}'. Reason: {e}")
@@ -951,7 +964,10 @@ class MainWindow(QMainWindow):
         if not self.animation_file: 
             self.log_message("Save cancelled: No animation data loaded.")
             return
-        file_name, _ = QFileDialog.getSaveFileName(self, "Save Animation File As", self.current_file_path or "", "JSON Files (*.json)")
+            
+        start_path = self.last_directory or self.current_file_path or ""
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Animation File As", start_path, "JSON Files (*.json)")
+        
         if file_name:
             if not file_name.lower().endswith('.json'):
                 file_name += '.json'
@@ -959,8 +975,13 @@ class MainWindow(QMainWindow):
                 with open(file_name, 'w', encoding='utf-8') as f:
                     json.dump(self.animation_file.to_dict(), f, indent=3, ensure_ascii=False)
                 self.current_file_path = file_name
-                self.setWindowTitle(f"VamTimeline Animation Editor - {file_name}")
+                self.setWindowTitle(f"Timeliner - {file_name}")
                 self.log_message(f"File saved as: {file_name}")
+                
+                # --- Remember last directory ---
+                self.last_directory = os.path.dirname(file_name)
+                self.settings.setValue("last_directory", self.last_directory)
+
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Error saving file: {e}")
                 self.log_message(f"ERROR: Failed to save file. Reason: {e}")
