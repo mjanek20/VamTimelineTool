@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QFileDialog, QLabel,
     QMenu, QMessageBox, QInputDialog, QToolBar, QFormLayout, QLineEdit,
     QListWidget, QPlainTextEdit, QPushButton, QDialog, QDialogButtonBox,
-    QRadioButton
+    QRadioButton, QStyle
 )
 
 DARK_STYLE = """
@@ -44,7 +44,7 @@ DARK_STYLE = """
         padding: 4px;
         border: 1px solid #555;
     }
-    QLineEdit, QListWidget {
+    QLineEdit, QListWidget, QPlainTextEdit {
         background-color: #3e3e3e;
         color: #e0e0e0;
         border: 1px solid #555;
@@ -78,11 +78,11 @@ DARK_STYLE = """
     QDialog {
          background-color: #2e2e2e;
     }
-    #LogConsole {
+    QPlainTextEdit#LogConsole {
         background-color: #212121;
         color: #d0d0d0;
         font-family: Consolas, monospace;
-        border: 1px solid #555;
+        border: 1px solid #444;
     }
 """
 
@@ -367,7 +367,8 @@ class MainWindow(QMainWindow):
         super().__init__(); self.animation_file, self.current_file_path = None, None; self.setWindowTitle("Timeliner")
         ico_path = os.path.join(getattr(sys, '_MEIPASS', os.path.abspath('.')), 'Timeliner.ico')
         if os.path.exists(ico_path): self.setWindowIcon(QIcon(ico_path))
-        self.setGeometry(100, 100, 1200, 800); self.settings = QSettings("VamTimelineTools", "TimelinerEditor"); self.last_directory = self.settings.value("last_directory", ""); self.init_ui()
+        self.setGeometry(100, 100, 1200, 800); self.settings = QSettings("VamTimelineTools", "TimelinerEditor"); self.last_directory = self.settings.value("last_directory", "")
+        self.init_ui()
         self.last_center_root_delta_xz = (0.0, 0.0)
 
     def init_ui(self):
@@ -404,14 +405,13 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(left_panel);main_layout.addWidget(right_panel)
         self.log_message("Application started.")
         
-        self.update_toolbar_icons() # Set initial icons
         is_dark = self.settings.value("darkModeEnabled", False, type=bool)
         self.dark_mode_action.setChecked(is_dark)
         self.apply_styles(is_dark)
 
     def toggle_dark_mode(self, checked):
-        self.apply_styles(checked)
         self.settings.setValue("darkModeEnabled", checked)
+        self.apply_styles(checked)
         self.log_message(f"Dark Mode {'Enabled' if checked else 'Disabled'}.")
 
     def apply_styles(self, is_dark):
@@ -419,14 +419,14 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(DARK_STYLE)
         else:
             app.setStyleSheet("")
-        # We need to re-set icons because the theme hint changes
         self.update_toolbar_icons()
 
     def update_toolbar_icons(self):
-        self.open_action.setIcon(QIcon.fromTheme("document-open"))
-        self.save_as_action.setIcon(QIcon.fromTheme("document-save-as"))
-        self.new_segment_action.setIcon(QIcon.fromTheme("list-add"))
-        self.delete_action.setIcon(QIcon.fromTheme("edit-delete"))
+        style = self.style()
+        self.open_action.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton))
+        self.save_as_action.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.new_segment_action.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder))
+        self.delete_action.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
 
     def get_tree_collapse_state(self):
         state = set()
