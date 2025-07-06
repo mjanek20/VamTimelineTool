@@ -17,6 +17,75 @@ from PyQt6.QtWidgets import (
     QRadioButton
 )
 
+DARK_STYLE = """
+    QWidget {
+        background-color: #2e2e2e;
+        color: #e0e0e0;
+        font-size: 10pt;
+    }
+    QMainWindow {
+        background-color: #2e2e2e;
+    }
+    QTreeWidget {
+        background-color: #252525;
+        color: #e0e0e0;
+        border: 1px solid #444;
+    }
+    QTreeWidget::item:selected {
+        background-color: #0078d7;
+        color: white;
+    }
+    QTreeWidget::item:hover {
+        background-color: #3e3e3e;
+    }
+    QHeaderView::section {
+        background-color: #3e3e3e;
+        color: #e0e0e0;
+        padding: 4px;
+        border: 1px solid #555;
+    }
+    QLineEdit, QListWidget {
+        background-color: #3e3e3e;
+        color: #e0e0e0;
+        border: 1px solid #555;
+        border-radius: 3px;
+        padding: 2px;
+    }
+    QPushButton, QDialogButtonBox > QPushButton {
+        background-color: #4a4a4a;
+        color: #e0e0e0;
+        border: 1px solid #555;
+        padding: 5px;
+        border-radius: 3px;
+    }
+    QPushButton:hover, QDialogButtonBox > QPushButton:hover {
+        background-color: #5a5a5a;
+    }
+    QPushButton:pressed, QDialogButtonBox > QPushButton:pressed {
+        background-color: #6a6a6a;
+    }
+    QMenuBar, QMenu {
+        background-color: #2e2e2e;
+        color: #e0e0e0;
+    }
+    QMenuBar::item:selected, QMenu::item:selected {
+        background-color: #0078d7;
+    }
+    QToolBar {
+        background-color: #2e2e2e;
+        border: none;
+    }
+    QDialog {
+         background-color: #2e2e2e;
+    }
+    #LogConsole {
+        background-color: #212121;
+        color: #d0d0d0;
+        font-family: Consolas, monospace;
+        border: 1px solid #555;
+    }
+"""
+
 # --- 1. Keyframe Encoding/Decoding Logic ---
 
 class KeyframeEncoder:
@@ -134,7 +203,6 @@ class AnimationTreeWidget(QTreeWidget):
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.open_context_menu)
-        self.setStyleSheet("QTreeWidget::item:selected { background-color: #a8d8ff; color: black; }")
         self.itemDoubleClicked.connect(self.on_item_double_clicked)
     def on_item_double_clicked(self, item, column): self.parent_window.rename_selected_item()
     def keyPressEvent(self, event):
@@ -303,20 +371,25 @@ class MainWindow(QMainWindow):
         self.last_center_root_delta_xz = (0.0, 0.0)
 
     def init_ui(self):
-        open_action=QAction(QIcon.fromTheme("document-open"),"&Open...",self);open_action.triggered.connect(self.open_file)
-        save_as_action=QAction(QIcon.fromTheme("document-save-as"),"&Save As...",self);save_as_action.triggered.connect(self.save_file_as)
+        self.open_action=QAction("&Open...",self);self.open_action.triggered.connect(self.open_file)
+        self.save_as_action=QAction("&Save As...",self);self.save_as_action.triggered.connect(self.save_file_as)
         exit_action=QAction("E&xit",self);exit_action.triggered.connect(self.close)
-        new_segment_action=QAction(QIcon.fromTheme("list-add"),"New &Segment...",self);new_segment_action.triggered.connect(self.create_new_segment)
-        rename_action=QAction(QIcon.fromTheme("edit-rename"),"Re&name...",self);rename_action.setShortcut("F2");rename_action.triggered.connect(self.rename_selected_item)
+        self.new_segment_action=QAction("New &Segment...",self);self.new_segment_action.triggered.connect(self.create_new_segment)
+        rename_action=QAction("Re&name...",self);rename_action.setShortcut("F2");rename_action.triggered.connect(self.rename_selected_item)
         batch_rename_action=QAction("Change Names in &Batch...",self);batch_rename_action.triggered.connect(self.batch_rename_items)
-        delete_action=QAction(QIcon.fromTheme("edit-delete"),"&Delete Selected",self);delete_action.setShortcut("Delete");delete_action.triggered.connect(self.delete_selected_items)
-        duplicate_action=QAction(QIcon.fromTheme("edit-copy"),"&Duplicate Clip",self);duplicate_action.setShortcut("Ctrl+D");duplicate_action.triggered.connect(self.duplicate_selected_clip)
-        center_root_action=QAction("Center Root on First Frame (XZ only)",self);center_root_action.triggered.connect(self.center_root_on_first_frame)
-        move_by_offset_action = QAction("Move Root by &Offset...", self); move_by_offset_action.triggered.connect(self.move_root_by_offset)
+        self.delete_action=QAction("&Delete Selected",self);self.delete_action.setShortcut("Delete");self.delete_action.triggered.connect(self.delete_selected_items)
+        duplicate_action=QAction("&Duplicate Clip",self);duplicate_action.setShortcut("Ctrl+D");duplicate_action.triggered.connect(self.duplicate_selected_clip)
+        center_root_action=QAction("Center &Root on First Frame",self);center_root_action.triggered.connect(self.center_root_on_first_frame)
+        move_by_offset_action = QAction("Move by &Offset...", self); move_by_offset_action.triggered.connect(self.move_root_by_offset)
+        self.dark_mode_action = QAction("&Dark Mode", self); self.dark_mode_action.setCheckable(True); self.dark_mode_action.toggled.connect(self.toggle_dark_mode)
 
-        menu_bar=self.menuBar();file_menu=menu_bar.addMenu("&File");file_menu.addAction(open_action);file_menu.addAction(save_as_action);file_menu.addSeparator();file_menu.addAction(new_segment_action);file_menu.addSeparator();file_menu.addAction(exit_action)
-        edit_menu=menu_bar.addMenu("&Edit");edit_menu.addAction(rename_action);edit_menu.addAction(batch_rename_action);edit_menu.addAction(duplicate_action);edit_menu.addSeparator();edit_menu.addAction(center_root_action);edit_menu.addAction(move_by_offset_action);edit_menu.addSeparator();edit_menu.addAction(delete_action)
-        toolbar=self.addToolBar("Main Toolbar");toolbar.addAction(open_action);toolbar.addAction(save_as_action);toolbar.addSeparator();toolbar.addAction(new_segment_action);toolbar.addAction(delete_action)
+        menu_bar=self.menuBar()
+        file_menu=menu_bar.addMenu("&File");file_menu.addAction(self.open_action);file_menu.addAction(self.save_as_action);file_menu.addSeparator();file_menu.addAction(self.new_segment_action);file_menu.addSeparator();file_menu.addAction(exit_action)
+        edit_menu=menu_bar.addMenu("&Edit");edit_menu.addAction(rename_action);edit_menu.addAction(batch_rename_action);edit_menu.addAction(duplicate_action);edit_menu.addSeparator();edit_menu.addAction(center_root_action);edit_menu.addAction(move_by_offset_action);edit_menu.addSeparator();edit_menu.addAction(self.delete_action)
+        view_menu=menu_bar.addMenu("&View"); view_menu.addAction(self.dark_mode_action)
+        
+        toolbar=self.addToolBar("Main Toolbar");toolbar.addAction(self.open_action);toolbar.addAction(self.save_as_action);toolbar.addSeparator();toolbar.addAction(self.new_segment_action);toolbar.addAction(self.delete_action)
+        
         main_widget=QWidget();self.setCentralWidget(main_widget);main_layout=QHBoxLayout(main_widget)
         left_panel=QWidget();left_layout=QVBoxLayout(left_panel);left_panel.setFixedWidth(400);filter_layout=QHBoxLayout();self.filter_edit=QLineEdit();self.filter_edit.setPlaceholderText("Filter animations...");self.filter_edit.textChanged.connect(self.filter_tree);filter_layout.addWidget(self.filter_edit)
         self.fold_all_button=QPushButton("Fold All");self.fold_all_button.clicked.connect(self.fold_all_items);filter_layout.addWidget(self.fold_all_button)
@@ -326,10 +399,34 @@ class MainWindow(QMainWindow):
         right_panel=QWidget();right_layout=QVBoxLayout(right_panel)
         self.placeholder_label=QLabel("Select a clip to see its properties.");self.placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.properties_panel=ClipPropertiesPanel(self)
-        self.log_console=QPlainTextEdit();self.log_console.setReadOnly(True);self.log_console.setFixedHeight(150);self.log_console.setStyleSheet("background-color: #f0f0f0; font-family: Consolas, monospace;")
+        self.log_console=QPlainTextEdit();self.log_console.setReadOnly(True);self.log_console.setFixedHeight(150);self.log_console.setObjectName("LogConsole")
         right_layout.addWidget(self.placeholder_label);right_layout.addWidget(self.properties_panel);right_layout.addStretch(1);right_layout.addWidget(QLabel("<b>Console Log</b>"));right_layout.addWidget(self.log_console)
         main_layout.addWidget(left_panel);main_layout.addWidget(right_panel)
         self.log_message("Application started.")
+        
+        self.update_toolbar_icons() # Set initial icons
+        is_dark = self.settings.value("darkModeEnabled", False, type=bool)
+        self.dark_mode_action.setChecked(is_dark)
+        self.apply_styles(is_dark)
+
+    def toggle_dark_mode(self, checked):
+        self.apply_styles(checked)
+        self.settings.setValue("darkModeEnabled", checked)
+        self.log_message(f"Dark Mode {'Enabled' if checked else 'Disabled'}.")
+
+    def apply_styles(self, is_dark):
+        if is_dark:
+            app.setStyleSheet(DARK_STYLE)
+        else:
+            app.setStyleSheet("")
+        # We need to re-set icons because the theme hint changes
+        self.update_toolbar_icons()
+
+    def update_toolbar_icons(self):
+        self.open_action.setIcon(QIcon.fromTheme("document-open"))
+        self.save_as_action.setIcon(QIcon.fromTheme("document-save-as"))
+        self.new_segment_action.setIcon(QIcon.fromTheme("list-add"))
+        self.delete_action.setIcon(QIcon.fromTheme("edit-delete"))
 
     def get_tree_collapse_state(self):
         state = set()
@@ -574,7 +671,7 @@ class MainWindow(QMainWindow):
                             other.other_properties["NextAnimationName"] = new
                     renamed += 1
             self.log_message(f"Batch renamed {renamed} clip(s)."); self.populate_animation_tree()
-    
+
     def _apply_position_delta_to_clips(self, clips, delta):
         processed_count = 0
         for clip in clips:
@@ -586,7 +683,7 @@ class MainWindow(QMainWindow):
                         if axis not in controller.properties: continue
                         
                         current_delta = delta[axis_idx]
-                        if math.isclose(current_delta, 0.0): continue # Skip if no change on this axis
+                        if math.isclose(current_delta, 0.0, abs_tol=1e-6): continue
 
                         new_keyframes, last_v, last_c = [], 0.0, 3
                         
@@ -603,8 +700,7 @@ class MainWindow(QMainWindow):
                 processed_count += 1
             except Exception as e:
                 self.log_message(f"ERROR: Failed to process clip '{clip.name}'. Reason: {e}")
-                import traceback
-                traceback.print_exc()
+                import traceback; traceback.print_exc()
 
         if self.current_file_path: self.setWindowTitle(self.windowTitle() + " *")
         self.on_tree_selection_changed(); self.populate_animation_tree()
@@ -619,18 +715,14 @@ class MainWindow(QMainWindow):
         if not clips_to_process:
             QMessageBox.warning(self, "Invalid Selection", "Please select valid animation clips."); return
 
-        self.log_message(f"Starting 'Center Root' operation for {len(clips_to_process)} clip(s)...")
-        
-        # This will only process the first selected clip to get the delta
+        self.log_message(f"Starting 'Center Root (XZ only)' operation for {len(clips_to_process)} clip(s)...")
         clip = clips_to_process[0]
         
         root_options = ['control', 'hipControl', 'pelvisControl']
         root_controller = next((c for name in root_options for c in clip.controllers if c.id == name), None)
-        lfoot_controller = next((c for c in clip.controllers if c.id == 'lFootControl'), None)
-        rfoot_controller = next((c for c in clip.controllers if c.id == 'rFootControl'), None)
 
-        if not all([root_controller, lfoot_controller, rfoot_controller]):
-            self.log_message(f"ERROR: Clip '{clip.name}' is missing required controllers (a root and both feet). Operation aborted.")
+        if not root_controller:
+            self.log_message(f"ERROR: Clip '{clip.name}' is missing a required root controller. Operation aborted.")
             return
 
         def get_pos_at_time(controller, axis, time_target=0.0):
@@ -644,14 +736,12 @@ class MainWindow(QMainWindow):
         p_root_local = [get_pos_at_time(root_controller, axis, 0.0) for axis in ['X', 'Y', 'Z']]
         
         delta_x = -p_root_local[0]
+        delta_y = 0.0
         delta_z = -p_root_local[2]
-        delta_y = 0.0 # Y axis modification is disabled
-
         delta = (delta_x, delta_y, delta_z)
         
-        # Store delta for the "Move by Offset" feature
         self.last_center_root_delta_xz = (delta_x, delta_z)
-        self.log_message(f"Calculated XZ delta from clip '{clip.name}': ({delta_x:.4f}, {delta_z:.4f}). Applying to all selected clips.")
+        self.log_message(f"Calculated XZ delta from root '{root_controller.id}' in clip '{clip.name}': ({delta_x:.4f}, {delta_z:.4f}). Applying to all selected clips.")
         
         processed_count = self._apply_position_delta_to_clips(clips_to_process, delta)
         self.log_message(f"Root centering (XZ only) operation finished. Processed {processed_count} clip(s).")
@@ -666,13 +756,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid Selection", "Please select valid animation clips."); return
 
         dialog = OffsetDialog(self)
-        # Pre-populate with last calculated delta
         dialog.set_initial_values(self.last_center_root_delta_xz[0], 0.0, self.last_center_root_delta_xz[1])
         
         if dialog.exec():
             offsets = dialog.get_offsets()
-            if offsets is None: # User entered invalid data
-                return
+            if offsets is None: return
             
             self.log_message(f"Applying manual offset {offsets} to {len(clips_to_process)} clip(s)...")
             processed_count = self._apply_position_delta_to_clips(clips_to_process, offsets)
@@ -682,30 +770,19 @@ class MainWindow(QMainWindow):
 class OffsetDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Move Root by Offset")
+        self.setWindowTitle("Move by Offset")
         layout = QFormLayout(self)
-        self.x_edit = QLineEdit()
-        self.y_edit = QLineEdit()
-        self.z_edit = QLineEdit()
-        layout.addRow("X Offset:", self.x_edit)
-        layout.addRow("Y Offset:", self.y_edit)
-        layout.addRow("Z Offset:", self.z_edit)
+        self.x_edit = QLineEdit(); self.y_edit = QLineEdit(); self.z_edit = QLineEdit()
+        layout.addRow("X Offset:", self.x_edit); layout.addRow("Y Offset:", self.y_edit); layout.addRow("Z Offset:", self.z_edit)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); layout.addRow(buttons)
         
     def set_initial_values(self, x, y, z):
-        self.x_edit.setText(f"{x:.4f}")
-        self.y_edit.setText(f"{y:.4f}")
-        self.z_edit.setText(f"{z:.4f}")
+        self.x_edit.setText(f"{x:.4f}"); self.y_edit.setText(f"{y:.4f}"); self.z_edit.setText(f"{z:.4f}")
 
     def get_offsets(self):
         try:
-            x = float(self.x_edit.text())
-            y = float(self.y_edit.text())
-            z = float(self.z_edit.text())
-            return (x, y, z)
+            return (float(self.x_edit.text()), float(self.y_edit.text()), float(self.z_edit.text()))
         except ValueError:
             QMessageBox.warning(self, "Invalid Input", "Please enter valid numbers for the offsets.")
             return None
@@ -716,10 +793,8 @@ class MergeConflictDialog(QDialog):
         self.setWindowTitle("Merge Clip Name Conflicts")
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("How should clips with conflicting names be handled?"))
-        self.rename_radio = QRadioButton("Rename and Add (e.g., 'Clip_merged')")
-        self.rename_radio.setChecked(True)
-        self.replace_radio = QRadioButton("Replace Existing Clips")
-        self.skip_radio = QRadioButton("Skip Conflicting Clips")
+        self.rename_radio = QRadioButton("Rename and Add (e.g., 'Clip_merged')"); self.rename_radio.setChecked(True)
+        self.replace_radio = QRadioButton("Replace Existing Clips"); self.skip_radio = QRadioButton("Skip Conflicting Clips")
         layout.addWidget(self.rename_radio); layout.addWidget(self.replace_radio); layout.addWidget(self.skip_radio)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
