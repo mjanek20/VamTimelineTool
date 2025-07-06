@@ -405,7 +405,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(left_panel);main_layout.addWidget(right_panel)
         self.log_message("Application started.")
         
-        is_dark = self.settings.value("darkModeEnabled", False, type=bool)
+        is_dark = self.settings.value("darkModeEnabled", True, type=bool)
         self.dark_mode_action.setChecked(is_dark)
         self.apply_styles(is_dark)
 
