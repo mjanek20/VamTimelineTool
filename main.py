@@ -300,6 +300,7 @@ class MainWindow(QMainWindow):
         ico_path = os.path.join(getattr(sys, '_MEIPASS', os.path.abspath('.')), 'Timeliner.ico')
         if os.path.exists(ico_path): self.setWindowIcon(QIcon(ico_path))
         self.setGeometry(100, 100, 1200, 800); self.settings = QSettings("VamTimelineTools", "TimelinerEditor"); self.last_directory = self.settings.value("last_directory", ""); self.init_ui()
+        self.last_center_root_delta_xz = (0.0, 0.0)
 
     def init_ui(self):
         open_action=QAction(QIcon.fromTheme("document-open"),"&Open...",self);open_action.triggered.connect(self.open_file)
@@ -310,9 +311,11 @@ class MainWindow(QMainWindow):
         batch_rename_action=QAction("Change Names in &Batch...",self);batch_rename_action.triggered.connect(self.batch_rename_items)
         delete_action=QAction(QIcon.fromTheme("edit-delete"),"&Delete Selected",self);delete_action.setShortcut("Delete");delete_action.triggered.connect(self.delete_selected_items)
         duplicate_action=QAction(QIcon.fromTheme("edit-copy"),"&Duplicate Clip",self);duplicate_action.setShortcut("Ctrl+D");duplicate_action.triggered.connect(self.duplicate_selected_clip)
-        center_root_action=QAction("Center &Root on First Frame",self);center_root_action.triggered.connect(self.center_root_on_first_frame)
+        center_root_action=QAction("Center Root on First Frame (XZ only)",self);center_root_action.triggered.connect(self.center_root_on_first_frame)
+        move_by_offset_action = QAction("Move Root by &Offset...", self); move_by_offset_action.triggered.connect(self.move_root_by_offset)
+
         menu_bar=self.menuBar();file_menu=menu_bar.addMenu("&File");file_menu.addAction(open_action);file_menu.addAction(save_as_action);file_menu.addSeparator();file_menu.addAction(new_segment_action);file_menu.addSeparator();file_menu.addAction(exit_action)
-        edit_menu=menu_bar.addMenu("&Edit");edit_menu.addAction(rename_action);edit_menu.addAction(batch_rename_action);edit_menu.addAction(duplicate_action);edit_menu.addSeparator();edit_menu.addAction(center_root_action);edit_menu.addSeparator();edit_menu.addAction(delete_action)
+        edit_menu=menu_bar.addMenu("&Edit");edit_menu.addAction(rename_action);edit_menu.addAction(batch_rename_action);edit_menu.addAction(duplicate_action);edit_menu.addSeparator();edit_menu.addAction(center_root_action);edit_menu.addAction(move_by_offset_action);edit_menu.addSeparator();edit_menu.addAction(delete_action)
         toolbar=self.addToolBar("Main Toolbar");toolbar.addAction(open_action);toolbar.addAction(save_as_action);toolbar.addSeparator();toolbar.addAction(new_segment_action);toolbar.addAction(delete_action)
         main_widget=QWidget();self.setCentralWidget(main_widget);main_layout=QHBoxLayout(main_widget)
         left_panel=QWidget();left_layout=QVBoxLayout(left_panel);left_panel.setFixedWidth(400);filter_layout=QHBoxLayout();self.filter_edit=QLineEdit();self.filter_edit.setPlaceholderText("Filter animations...");self.filter_edit.textChanged.connect(self.filter_tree);filter_layout.addWidget(self.filter_edit)
@@ -571,69 +574,26 @@ class MainWindow(QMainWindow):
                             other.other_properties["NextAnimationName"] = new
                     renamed += 1
             self.log_message(f"Batch renamed {renamed} clip(s)."); self.populate_animation_tree()
-
-    def center_root_on_first_frame(self):
-        selected_items = self.tree.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "No Selection", "Please select one or more clips to process."); return
-
-        clips_to_process = [item.data(0, 1000) for item in selected_items if isinstance(item.data(0, 1000), AnimationClip)]
-        if not clips_to_process:
-            QMessageBox.warning(self, "Invalid Selection", "Please select valid animation clips."); return
-
-        self.log_message(f"Starting 'Center Root' operation for {len(clips_to_process)} clip(s)...")
+    
+    def _apply_position_delta_to_clips(self, clips, delta):
         processed_count = 0
-        for clip in clips_to_process:
+        for clip in clips:
             try:
-                # 1. Identify root controller (flexible) and feet
-                root_options = ['control', 'hipControl', 'pelvisControl']
-                root_controller = next((c for name in root_options for c in clip.controllers if c.id == name), None)
-                lfoot_controller = next((c for c in clip.controllers if c.id == 'lFootControl'), None)
-                rfoot_controller = next((c for c in clip.controllers if c.id == 'rFootControl'), None)
-
-                if not all([root_controller, lfoot_controller, rfoot_controller]):
-                    self.log_message(f"WARNING: Skipping clip '{clip.name}'. Missing required controllers (a root, and both feet).")
-                    continue
-
-                # 2. Decode first keyframe to get initial local positions
-                def get_pos_at_time(controller, axis, time_target):
-                    last_v, last_c = 0.0, 3 # Start with safe defaults
-                    for kf_str in controller.properties.get(axis, []):
-                        t, v, c = KeyframeDecoder.decode_keyframe(kf_str, last_v, last_c)
-                        if math.isclose(t, time_target, abs_tol=1e-5): return v
-                        last_v, last_c = v, c
-                    self.log_message(f"WARNING: No keyframe at t={time_target} for {controller.id}/{axis}. Using 0.0.")
-                    return 0.0 
-
-                p_root_local = [get_pos_at_time(root_controller, axis, 0.0) for axis in ['X', 'Y', 'Z']]
-                p_lfoot_local = [get_pos_at_time(lfoot_controller, axis, 0.0) for axis in ['X', 'Y', 'Z']]
-                p_rfoot_local = [get_pos_at_time(rfoot_controller, axis, 0.0) for axis in ['X', 'Y', 'Z']]
-                
-                # 3. Calculate the delta to apply to ALL controllers' keyframes
-                delta_x = -p_root_local[0]
-                delta_z = -p_root_local[2]
-                delta_y = 0 # Y-axis modification is disabled as per user request
-
-                delta = (delta_x, delta_y, delta_z)
-                
-                self.log_message(f"Clip '{clip.name}': Applying delta XZ ({delta_x:.4f}, {delta_z:.4f}) to all controllers.")
-                
-                # 4. Apply the calculated delta to all position keyframes of all controllers
                 for controller in clip.controllers:
-                    if controller.id.endswith("Rotation"): continue # Skip pure rotation controllers if any
+                    if controller.id.endswith("Rotation"): continue
                     
-                    # Apply delta to X and Z axis, leave Y untouched
-                    for axis_idx, axis in enumerate(['X', 'Z']):
+                    for axis_idx, axis in enumerate(['X', 'Y', 'Z']):
                         if axis not in controller.properties: continue
                         
                         current_delta = delta[axis_idx]
+                        if math.isclose(current_delta, 0.0): continue # Skip if no change on this axis
+
                         new_keyframes, last_v, last_c = [], 0.0, 3
                         
                         sorted_kfs = sorted(
                             [KeyframeDecoder.decode_keyframe(kf, 0.0, 3) for kf in controller.properties[axis]],
                             key=lambda k: k[0]
                         )
-
                         for t, v, c in sorted_kfs:
                             new_v = v + current_delta
                             new_kf_str = KeyframeEncoder.encode_keyframe(t, new_v, c, last_v, last_c)
@@ -646,10 +606,109 @@ class MainWindow(QMainWindow):
                 import traceback
                 traceback.print_exc()
 
-        self.log_message(f"Root centering operation finished. Processed {processed_count} clip(s).")
         if self.current_file_path: self.setWindowTitle(self.windowTitle() + " *")
         self.on_tree_selection_changed(); self.populate_animation_tree()
+        return processed_count
 
+    def center_root_on_first_frame(self):
+        selected_items = self.tree.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select one or more clips to process."); return
+
+        clips_to_process = [item.data(0, 1000) for item in selected_items if isinstance(item.data(0, 1000), AnimationClip)]
+        if not clips_to_process:
+            QMessageBox.warning(self, "Invalid Selection", "Please select valid animation clips."); return
+
+        self.log_message(f"Starting 'Center Root' operation for {len(clips_to_process)} clip(s)...")
+        
+        # This will only process the first selected clip to get the delta
+        clip = clips_to_process[0]
+        
+        root_options = ['control', 'hipControl', 'pelvisControl']
+        root_controller = next((c for name in root_options for c in clip.controllers if c.id == name), None)
+        lfoot_controller = next((c for c in clip.controllers if c.id == 'lFootControl'), None)
+        rfoot_controller = next((c for c in clip.controllers if c.id == 'rFootControl'), None)
+
+        if not all([root_controller, lfoot_controller, rfoot_controller]):
+            self.log_message(f"ERROR: Clip '{clip.name}' is missing required controllers (a root and both feet). Operation aborted.")
+            return
+
+        def get_pos_at_time(controller, axis, time_target=0.0):
+            last_v, last_c = 0.0, 3
+            for kf_str in controller.properties.get(axis, []):
+                t, v, c = KeyframeDecoder.decode_keyframe(kf_str, last_v, last_c)
+                if math.isclose(t, time_target, abs_tol=1e-5): return v
+                last_v, last_c = v, c
+            return 0.0 
+
+        p_root_local = [get_pos_at_time(root_controller, axis, 0.0) for axis in ['X', 'Y', 'Z']]
+        
+        delta_x = -p_root_local[0]
+        delta_z = -p_root_local[2]
+        delta_y = 0.0 # Y axis modification is disabled
+
+        delta = (delta_x, delta_y, delta_z)
+        
+        # Store delta for the "Move by Offset" feature
+        self.last_center_root_delta_xz = (delta_x, delta_z)
+        self.log_message(f"Calculated XZ delta from clip '{clip.name}': ({delta_x:.4f}, {delta_z:.4f}). Applying to all selected clips.")
+        
+        processed_count = self._apply_position_delta_to_clips(clips_to_process, delta)
+        self.log_message(f"Root centering (XZ only) operation finished. Processed {processed_count} clip(s).")
+
+    def move_root_by_offset(self):
+        selected_items = self.tree.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select one or more clips to process."); return
+            
+        clips_to_process = [item.data(0, 1000) for item in selected_items if isinstance(item.data(0, 1000), AnimationClip)]
+        if not clips_to_process:
+            QMessageBox.warning(self, "Invalid Selection", "Please select valid animation clips."); return
+
+        dialog = OffsetDialog(self)
+        # Pre-populate with last calculated delta
+        dialog.set_initial_values(self.last_center_root_delta_xz[0], 0.0, self.last_center_root_delta_xz[1])
+        
+        if dialog.exec():
+            offsets = dialog.get_offsets()
+            if offsets is None: # User entered invalid data
+                return
+            
+            self.log_message(f"Applying manual offset {offsets} to {len(clips_to_process)} clip(s)...")
+            processed_count = self._apply_position_delta_to_clips(clips_to_process, offsets)
+            self.log_message(f"Manual offset operation finished. Processed {processed_count} clip(s).")
+
+
+class OffsetDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Move Root by Offset")
+        layout = QFormLayout(self)
+        self.x_edit = QLineEdit()
+        self.y_edit = QLineEdit()
+        self.z_edit = QLineEdit()
+        layout.addRow("X Offset:", self.x_edit)
+        layout.addRow("Y Offset:", self.y_edit)
+        layout.addRow("Z Offset:", self.z_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+        
+    def set_initial_values(self, x, y, z):
+        self.x_edit.setText(f"{x:.4f}")
+        self.y_edit.setText(f"{y:.4f}")
+        self.z_edit.setText(f"{z:.4f}")
+
+    def get_offsets(self):
+        try:
+            x = float(self.x_edit.text())
+            y = float(self.y_edit.text())
+            z = float(self.z_edit.text())
+            return (x, y, z)
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", "Please enter valid numbers for the offsets.")
+            return None
 
 class MergeConflictDialog(QDialog):
     def __init__(self, parent=None):
