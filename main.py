@@ -365,7 +365,7 @@ class ClipPropertiesPanel(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__(); self.animation_file, self.current_file_path = None, None; self.setWindowTitle("Timeliner")
-        ico_path = os.path.join(getattr(sys, '_MEIPASS', os.path.abspath('.')), 'Timeliner.ico')
+        ico_path = os.path.join(getattr(sys, '_MEIPASS', os.path.abspath('.')), 'timeliner-logo.ico')
         if os.path.exists(ico_path): self.setWindowIcon(QIcon(ico_path))
         self.setGeometry(100, 100, 1200, 800); self.settings = QSettings("VamTimelineTools", "TimelinerEditor"); self.last_directory = self.settings.value("last_directory", "")
         self.init_ui()
