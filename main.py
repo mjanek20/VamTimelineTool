@@ -4,6 +4,7 @@ import json
 import copy
 import struct
 from collections import defaultdict
+import math
 
 # Using PyQt6 for the GUI
 from PyQt6.QtCore import Qt, QMimeData, QDateTime, QSettings
@@ -16,50 +17,64 @@ from PyQt6.QtWidgets import (
     QRadioButton
 )
 
-# --- 1. Keyframe Encoding Logic ---
+# --- 1. Keyframe Encoding/Decoding Logic ---
 
 class KeyframeEncoder:
     """
-    Replicates the keyframe encoding/decoding logic from AtomAnimationSerializer.cs.
-    This is crucial for creating new "empty" animation data that the plugin can read.
+    Replicates the keyframe encoding logic from AtomAnimationSerializer.cs.
     """
     @staticmethod
     def encode_keyframe(time: float, value: float, curve_type: int, last_v: float, last_c: int) -> str:
         """Encodes a single keyframe into the plugin's string format."""
         sb = []
-        
         has_value = abs(last_v - value) > 1e-7
         has_curve_type = last_c != curve_type
-
-        # Encode flags into the first character
         encoded_value = 0
         if has_value: encoded_value |= (1 << 0)
         if has_curve_type: encoded_value |= (1 << 1)
         sb.append(chr(ord('A') + encoded_value))
-
-        # Pack time, value, and curve_type into hex strings
         sb.append(struct.pack('<f', time).hex().upper())
         if has_value:
             sb.append(struct.pack('<f', value).hex().upper())
         if has_curve_type:
             sb.append(struct.pack('<B', curve_type).hex().upper())
-            
         return "".join(sb)
+
+class KeyframeDecoder:
+    """
+    Replicates the keyframe decoding logic from AtomAnimationSerializer.cs.
+    """
+    @staticmethod
+    def decode_keyframe(encoded_str: str, last_v: float, last_c: int) -> tuple[float, float, int]:
+        """Decodes a single keyframe from the plugin's string format."""
+        if not encoded_str: raise ValueError("Encoded string is empty")
+        flag_char = encoded_str[0]
+        encoded_value = ord(flag_char) - ord('A')
+        has_value = (encoded_value & (1 << 0)) != 0
+        has_curve_type = (encoded_value & (1 << 1)) != 0
+        ptr = 1
+        time_hex = encoded_str[ptr:ptr+8]
+        time = struct.unpack('<f', bytes.fromhex(time_hex))[0]
+        ptr += 8
+        value = last_v
+        if has_value:
+            value_hex = encoded_str[ptr:ptr+8]
+            value = struct.unpack('<f', bytes.fromhex(value_hex))[0]
+            ptr += 8
+        curve_type = last_c
+        if has_curve_type:
+            curve_type_hex = encoded_str[ptr:ptr+2]
+            curve_type = struct.unpack('<B', bytes.fromhex(curve_type_hex))[0]
+            ptr += 2
+        return time, value, curve_type
 
 # --- 2. Data Model ---
 
 class FloatParameter:
     def __init__(self, storable, name, value, min_val, max_val):
-        self.storable = storable
-        self.name = name
-        self.value = value
-        self.min = min_val
-        self.max = max_val
-
+        self.storable, self.name, self.value, self.min, self.max = storable, name, value, min_val, max_val
     @classmethod
-    def from_dict(cls, data):
-        return cls(data.get("Storable"), data.get("Name"), data.get("Value", []), data.get("Min"), data.get("Max"))
-
+    def from_dict(cls, data): return cls(data.get("Storable"), data.get("Name"), data.get("Value", []), data.get("Min"), data.get("Max"))
     def to_dict(self):
         props = {"Storable": self.storable, "Name": self.name, "Value": self.value}
         if self.min is not None: props["Min"] = self.min
@@ -68,1252 +83,604 @@ class FloatParameter:
 
 class ControllerTarget:
     def __init__(self, controller_id, **kwargs):
-        self.id = controller_id
-        self.properties = kwargs
+        self.id, self.properties = controller_id, kwargs
         for key in ['X', 'Y', 'Z', 'RotX', 'RotY', 'RotZ', 'RotW']:
-            if key not in self.properties:
-                self.properties[key] = []
-
+            if key not in self.properties: self.properties[key] = []
     @classmethod
     def from_dict(cls, data):
         controller_id = data.get("Controller")
-        properties = {k: v for k, v in data.items() if k != "Controller"}
-        return cls(controller_id, **properties)
-
+        return cls(controller_id, **{k: v for k, v in data.items() if k != "Controller"})
     def to_dict(self):
-        data = {"Controller": self.id}
-        data.update(self.properties)
-        return data
+        data = {"Controller": self.id}; data.update(self.properties); return data
 
 class AnimationClip:
     def __init__(self, name, segment, layer, length, order_index=0, **kwargs):
-        self.name = name
-        self.segment = segment
-        self.layer = layer
-        self.length = length
-        self.order_index = order_index
-        self.other_properties = kwargs
-        self.float_params = []
-        self.controllers = []
-
+        self.name, self.segment, self.layer, self.length, self.order_index = name, segment, layer, length, order_index
+        self.other_properties, self.float_params, self.controllers = kwargs, [], []
     @classmethod
     def from_dict(cls, data):
         known_keys = {"AnimationName", "AnimationSegment", "AnimationLayer", "AnimationLength", "FloatParams", "Controllers", "OrderIndex"}
-        instance = cls(
-            name=data.get("AnimationName", "Unnamed"),
-            segment=data.get("AnimationSegment", "Default"),
-            layer=data.get("AnimationLayer", "Default"),
-            length=float(data.get("AnimationLength", 0.0)),
-            order_index=int(data.get("OrderIndex", 0)),
-            **{k: v for k, v in data.items() if k not in known_keys}
-        )
-        if "FloatParams" in data:
-            instance.float_params = [FloatParameter.from_dict(p) for p in data["FloatParams"]]
-        if "Controllers" in data:
-            instance.controllers = [ControllerTarget.from_dict(c) for c in data["Controllers"]]
+        instance = cls(name=data.get("AnimationName", "Unnamed"), segment=data.get("AnimationSegment", "Default"), layer=data.get("AnimationLayer", "Default"), length=float(data.get("AnimationLength", 0.0)), order_index=int(data.get("OrderIndex", 0)), **{k: v for k, v in data.items() if k not in known_keys})
+        if "FloatParams" in data: instance.float_params = [FloatParameter.from_dict(p) for p in data["FloatParams"]]
+        if "Controllers" in data: instance.controllers = [ControllerTarget.from_dict(c) for c in data["Controllers"]]
         return instance
-
     def to_dict(self):
-        data = {
-            "AnimationName": self.name,
-            "AnimationSegment": self.segment,
-            "AnimationLayer": self.layer,
-            "AnimationLength": str(self.length),
-        }
-        data.update(self.other_properties)
-        if self.float_params:
-            data["FloatParams"] = [p.to_dict() for p in sorted(self.float_params, key=lambda p: (p.storable, p.name))]
-        if self.controllers:
-            data["Controllers"] = [c.to_dict() for c in sorted(self.controllers, key=lambda c: c.id)]
+        data = {"AnimationName": self.name, "AnimationSegment": self.segment, "AnimationLayer": self.layer, "AnimationLength": str(self.length)}; data.update(self.other_properties)
+        if self.float_params: data["FloatParams"] = [p.to_dict() for p in sorted(self.float_params, key=lambda p: (p.storable, p.name))]
+        if self.controllers: data["Controllers"] = [c.to_dict() for c in sorted(self.controllers, key=lambda c: c.id)]
         return data
 
 class AnimationFile:
     def __init__(self, version, atom_type):
-        self.version = version
-        self.atom_type = atom_type
-        self.clips = []
-
+        self.version, self.atom_type, self.clips = version, atom_type, []
     @classmethod
     def from_dict(cls, data):
         instance = cls(data.get("SerializeVersion"), data.get("AtomType"))
         if "Clips" in data:
-            # Assign an order index to preserve original file order
-            for i, clip_data in enumerate(data["Clips"]):
-                clip_data['OrderIndex'] = i
+            for i, clip_data in enumerate(data["Clips"]): clip_data['OrderIndex'] = i
             instance.clips = [AnimationClip.from_dict(c) for c in data["Clips"]]
         return instance
-
     def to_dict(self):
-        # Sort clips by their order index before saving to maintain user's arrangement
         self.clips.sort(key=lambda c: c.order_index)
-        return {
-            "SerializeVersion": self.version,
-            "AtomType": self.atom_type,
-            "Clips": [c.to_dict() for c in self.clips]
-        }
+        return {"SerializeVersion": self.version, "AtomType": self.atom_type, "Clips": [c.to_dict() for c in self.clips]}
 
 # --- 3. Custom UI Components ---
 
 class AnimationTreeWidget(QTreeWidget):
     def __init__(self, parent_window):
-        super().__init__()
-        self.parent_window = parent_window
-        self.setDragEnabled(True)
-        self.setAcceptDrops(True)
-        self.setDropIndicatorShown(True)
+        super().__init__(); self.parent_window = parent_window
+        self.setDragEnabled(True); self.setAcceptDrops(True); self.setDropIndicatorShown(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.open_context_menu)
-        
-        # --- Style for better selection visibility ---
-        self.setStyleSheet("""
-            QTreeWidget::item:selected {
-                background-color: #a8d8ff;
-                color: black;
-            }
-        """)
-
+        self.setStyleSheet("QTreeWidget::item:selected { background-color: #a8d8ff; color: black; }")
         self.itemDoubleClicked.connect(self.on_item_double_clicked)
-    
-    def on_item_double_clicked(self, item, column):
-        self.parent_window.rename_selected_item()
-
+    def on_item_double_clicked(self, item, column): self.parent_window.rename_selected_item()
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_F2:
-            self.parent_window.rename_selected_item()
-        elif event.key() == Qt.Key.Key_Delete:
-            self.parent_window.delete_selected_items()
-        else:
-            super().keyPressEvent(event)
-
+        if event.key() == Qt.Key.Key_F2: self.parent_window.rename_selected_item()
+        elif event.key() == Qt.Key.Key_Delete: self.parent_window.delete_selected_items()
+        else: super().keyPressEvent(event)
     def dragEnterEvent(self, event):
-        if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]:
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-
+        if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]: event.acceptProposedAction()
+        else: super().dragEnterEvent(event)
     def dragMoveEvent(self, event):
-        if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]:
-            event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
-            
+        if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]: event.acceptProposedAction()
+        else: super().dragMoveEvent(event)
     def startDrag(self, supportedActions):
-        items = self.selectedItems()
+        items = self.selectedItems();
         if not items: return
-        
-        item = items[0]
-        drag = QDrag(self)
-        mime_data = QMimeData()
-        
-        # Dragging a layer
+        item, drag, mime_data = items[0], QDrag(self), QMimeData()
         if item.parent() and not item.parent().parent():
-            if len(items) > 1: return # Only allow single layer drag
-            mime_data.setText("layer-drag")
-            drag.setMimeData(mime_data)
-            drag.exec(Qt.DropAction.MoveAction)
-        # Dragging a clip
+            if len(items) > 1: return
+            mime_data.setText("layer-drag"); drag.setMimeData(mime_data); drag.exec(Qt.DropAction.MoveAction)
         elif item.parent() and item.parent().parent():
-            mime_data.setText("clip-drag")
-            drag.setMimeData(mime_data)
-            # Allow both Move and Copy actions
-            drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction, Qt.DropAction.MoveAction)
-    
+            mime_data.setText("clip-drag"); drag.setMimeData(mime_data); drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction, Qt.DropAction.MoveAction)
     def dropEvent(self, event):
         mime_text = event.mimeData().text()
-        if mime_text == "clip-drag":
-            self.handle_clip_drop(event)
-        elif mime_text == "layer-drag":
-            self.handle_layer_merge(event)
-        else:
-            event.ignore()
-            
-    def get_layer_clips(self, segment_name, layer_name):
-        return [c for c in self.parent_window.animation_file.clips if c.segment == segment_name and c.layer == layer_name]
-
+        if mime_text == "clip-drag": self.handle_clip_drop(event)
+        elif mime_text == "layer-drag": self.handle_layer_merge(event)
+        else: event.ignore()
+    def get_layer_clips(self, segment_name, layer_name): return [c for c in self.parent_window.animation_file.clips if c.segment == segment_name and c.layer == layer_name]
     def get_layer_target_signature(self, segment_name, layer_name, anim_file):
         clips = [c for c in anim_file.clips if c.segment == segment_name and c.layer == layer_name]
         if not clips: return frozenset(), frozenset()
-        
-        float_params_keys = {(p.storable, p.name) for c in clips for p in c.float_params}
-        controller_ids = {c.id for clip in clips for c in clip.controllers}
-        return frozenset(float_params_keys), frozenset(controller_ids)
-
+        fp_keys = {(p.storable, p.name) for c in clips for p in c.float_params}; c_ids = {c.id for clip in clips for c in clip.controllers}
+        return frozenset(fp_keys), frozenset(c_ids)
     def handle_layer_merge(self, event):
-        source_layer_item = self.selectedItems()[0]
-        target_item_at_point = self.itemAt(event.position().toPoint())
-        
+        source_item, target_item_at_point = self.selectedItems()[0], self.itemAt(event.position().toPoint())
         target_layer_item = None
         if target_item_at_point:
-            if target_item_at_point.parent() and not target_item_at_point.parent().parent(): # Dropped on layer
-                target_layer_item = target_item_at_point
-            elif target_item_at_point.parent() and target_item_at_point.parent().parent(): # Dropped on clip
-                target_layer_item = target_item_at_point.parent()
-        
-        if not target_layer_item or source_layer_item == target_layer_item:
-            event.ignore(); return
-            
-        if source_layer_item.parent() != target_layer_item.parent():
-            QMessageBox.warning(self, "Invalid Operation", "Layers can only be merged within the same segment.")
-            return
-
-        source_layer_name_clean = source_layer_item.text(0).strip()
-        target_layer_name_clean = target_layer_item.text(0).strip()
-        reply = QMessageBox.question(self, 'Confirm Layer Merge',
-                                     f"Are you sure you want to merge '{source_layer_name_clean}' into '{target_layer_name_clean}'?\n\n"
-                                     "This will add missing targets to all animations in the target layer and cannot be undone.",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
-        
-        if reply == QMessageBox.StandardButton.No:
-            event.ignore(); return
-
-        segment_name = target_layer_item.parent().text(0).replace("Segment: ", "").strip()
-        source_layer_name = source_layer_item.text(0).replace("  Layer: ", "").strip()
-        target_layer_name = target_layer_item.text(0).replace("  Layer: ", "").strip()
-        self.parent_window.log_message(f"Initiating merge of layer '{source_layer_name}' into '{target_layer_name}' in segment '{segment_name}'.")
-
-        source_clips = self.get_layer_clips(segment_name, source_layer_name)
-        target_clips = self.get_layer_clips(segment_name, target_layer_name)
-
-        # Create a master list of all targets from both layers
-        master_float_params = { (p.storable, p.name): p for clip in source_clips + target_clips for p in clip.float_params }
-        master_controllers = { c.id: c for clip in source_clips + target_clips for c in clip.controllers }
-
-        # Merge clips with the same name, move the others
-        target_clips_by_name = {clip.name: clip for clip in target_clips}
-        for source_clip in source_clips:
-            if source_clip.name in target_clips_by_name:
-                self.parent_window.log_message(f"Merging clip '{source_clip.name}' from source layer into target layer.")
-                target_clip = target_clips_by_name[source_clip.name]
-                # Merge FloatParams
-                existing_fp_keys = {(p.storable, p.name) for p in target_clip.float_params}
-                for param in source_clip.float_params:
-                    if (param.storable, param.name) not in existing_fp_keys:
-                        target_clip.float_params.append(param)
-                # Merge Controllers
-                existing_controller_ids = {c.id for c in target_clip.controllers}
-                for controller in source_clip.controllers:
-                    if controller.id not in existing_controller_ids:
-                        target_clip.controllers.append(controller)
-                self.parent_window.animation_file.clips.remove(source_clip)
-            else:
-                # Just move the clip to the new layer
-                self.parent_window.log_message(f"Moving clip '{source_clip.name}' to target layer '{target_layer_name}'.")
-                source_clip.layer = target_layer_name
-        
-        # Ensure all clips in the target layer have all master targets
-        self.parent_window.log_message(f"Harmonizing targets for all clips in layer '{target_layer_name}'...")
-        final_target_clips = self.get_layer_clips(segment_name, target_layer_name)
-        for clip in final_target_clips:
-            # Add missing float params
+            if target_item_at_point.parent() and not target_item_at_point.parent().parent(): target_layer_item = target_item_at_point
+            elif target_item_at_point.parent() and target_item_at_point.parent().parent(): target_layer_item = target_item_at_point.parent()
+        if not target_layer_item or source_item == target_layer_item: event.ignore(); return
+        if source_item.parent() != target_layer_item.parent(): QMessageBox.warning(self, "Invalid Operation", "Layers can only be merged within the same segment."); return
+        reply = QMessageBox.question(self, 'Confirm Layer Merge', f"Merge '{source_item.text(0).strip()}' into '{target_layer_item.text(0).strip()}'?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.No: event.ignore(); return
+        seg_name = target_layer_item.parent().text(0).replace("Segment: ", "").strip(); src_layer_name = source_item.text(0).replace("  Layer: ", "").strip(); tgt_layer_name = target_layer_item.text(0).replace("  Layer: ", "").strip()
+        self.parent_window.log_message(f"Merging layer '{src_layer_name}' into '{tgt_layer_name}' in segment '{seg_name}'.")
+        src_clips, tgt_clips = self.get_layer_clips(seg_name, src_layer_name), self.get_layer_clips(seg_name, tgt_layer_name)
+        master_fp = {(p.storable, p.name): p for clip in src_clips + tgt_clips for p in clip.float_params}
+        master_c = {c.id: c for clip in src_clips + tgt_clips for c in clip.controllers}
+        tgt_clips_by_name = {clip.name: clip for clip in tgt_clips}
+        for src_clip in src_clips:
+            if src_clip.name in tgt_clips_by_name:
+                tgt_clip = tgt_clips_by_name[src_clip.name]
+                existing_fp = {(p.storable, p.name) for p in tgt_clip.float_params}; existing_c = {c.id for c in tgt_clip.controllers}
+                for param in src_clip.float_params:
+                    if (param.storable, param.name) not in existing_fp: tgt_clip.float_params.append(param)
+                for controller in src_clip.controllers:
+                    if controller.id not in existing_c: tgt_clip.controllers.append(controller)
+                self.parent_window.animation_file.clips.remove(src_clip)
+            else: src_clip.layer = tgt_layer_name
+        final_tgt_clips = self.get_layer_clips(seg_name, tgt_layer_name)
+        for clip in final_tgt_clips:
             clip_fp_keys = {(p.storable, p.name) for p in clip.float_params}
-            for target_key, template_param in master_float_params.items():
-                if target_key not in clip_fp_keys:
-                    kf1 = KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0.0, -1)
-                    kf2 = KeyframeEncoder.encode_keyframe(clip.length, 0.0, 3, 0.0, 3)
-                    clip.float_params.append(FloatParameter(
-                        template_param.storable, template_param.name, [kf1, kf2], 
-                        template_param.min, template_param.max))
-            
-            # Add missing controllers
-            clip_controller_ids = {c.id for c in clip.controllers}
-            for controller_id, template_controller in master_controllers.items():
-                if controller_id not in clip_controller_ids:
-                    new_controller = ControllerTarget(controller_id, **copy.deepcopy(template_controller.properties))
-                    pos_val, rot_val, rotw_val = 0.0, 0.0, 1.0
-                    for axis in ['X', 'Y', 'Z']:
-                        kf1 = KeyframeEncoder.encode_keyframe(0.0, pos_val, 3, 0.0, -1)
-                        kf2 = KeyframeEncoder.encode_keyframe(clip.length, pos_val, 3, pos_val, 3)
-                        new_controller.properties[axis] = [kf1, kf2]
-                    for axis in ['RotX', 'RotY', 'RotZ']:
-                        kf1 = KeyframeEncoder.encode_keyframe(0.0, rot_val, 3, 0.0, -1)
-                        kf2 = KeyframeEncoder.encode_keyframe(clip.length, rot_val, 3, rot_val, 3)
-                        new_controller.properties[axis] = [kf1, kf2]
-                    kf1_w = KeyframeEncoder.encode_keyframe(0.0, rotw_val, 3, 0.0, -1)
-                    kf2_w = KeyframeEncoder.encode_keyframe(clip.length, rotw_val, 3, rotw_val, 3)
-                    new_controller.properties['RotW'] = [kf1_w, kf2_w]
-                    clip.controllers.append(new_controller)
-
-        self.parent_window.log_message(f"Layer merge complete. '{source_layer_name}' has been merged into '{target_layer_name}'.")
-        self.parent_window.populate_animation_tree()
-        event.acceptProposedAction()
-
+            for key, t_param in master_fp.items():
+                if key not in clip_fp_keys:
+                    kf1, kf2 = KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0.0, -1), KeyframeEncoder.encode_keyframe(clip.length, 0.0, 3, 0.0, 3)
+                    clip.float_params.append(FloatParameter(t_param.storable, t_param.name, [kf1, kf2], t_param.min, t_param.max))
+            clip_c_ids = {c.id for c in clip.controllers}
+            for c_id, t_ctrl in master_c.items():
+                if c_id not in clip_c_ids:
+                    new_c = ControllerTarget(c_id, **copy.deepcopy(t_ctrl.properties))
+                    for axis in ['X','Y','Z']: kf1, kf2 = KeyframeEncoder.encode_keyframe(0.0,0.0,3,0.0,-1),KeyframeEncoder.encode_keyframe(clip.length,0.0,3,0.0,3); new_c.properties[axis] = [kf1, kf2]
+                    for axis in ['RotX','RotY','RotZ']: kf1, kf2 = KeyframeEncoder.encode_keyframe(0.0,0.0,3,0.0,-1),KeyframeEncoder.encode_keyframe(clip.length,0.0,3,0.0,3); new_c.properties[axis] = [kf1, kf2]
+                    kf1w, kf2w = KeyframeEncoder.encode_keyframe(0.0,1.0,3,0.0,-1),KeyframeEncoder.encode_keyframe(clip.length,1.0,3,1.0,3); new_c.properties['RotW'] = [kf1w, kf2w]
+                    clip.controllers.append(new_c)
+        self.parent_window.log_message("Layer merge complete."); self.parent_window.populate_animation_tree(); event.acceptProposedAction()
     def handle_clip_drop(self, event):
-        source_items = self.selectedItems()
-        target_item = self.itemAt(event.position().toPoint())
-        if not source_items or not target_item:
-            event.ignore(); return
-
-        is_copy = event.proposedAction() == Qt.DropAction.CopyAction
-        source_layer_item = source_items[0].parent()
-
-        # Determine the target layer
+        source_items, target_item = self.selectedItems(), self.itemAt(event.position().toPoint())
+        if not source_items or not target_item: event.ignore(); return
+        is_copy, source_layer_item = event.proposedAction() == Qt.DropAction.CopyAction, source_items[0].parent()
         target_layer_item = None
-        if isinstance(target_item.data(0, 1000), AnimationClip):
-            target_layer_item = target_item.parent()
-        elif target_item.childCount() > 0 and isinstance(target_item.child(0).data(0, 1000), AnimationClip):
-            target_layer_item = target_item
-        
-        if not target_layer_item:
-            event.ignore(); return
-        
-        # Case 1: Reordering within the same layer
-        if not is_copy and source_layer_item == target_layer_item:
-            self.reorder_clips_in_layer(source_items, target_item, event)
-        # Case 2: Moving or copying to a different layer/segment
-        else:
-            self.move_or_copy_clips_to_layer(source_items, target_layer_item, is_copy, event)
-            
-        self.parent_window.populate_animation_tree()
-        event.acceptProposedAction()
-
+        if isinstance(target_item.data(0, 1000), AnimationClip): target_layer_item = target_item.parent()
+        elif target_item.childCount() > 0 and isinstance(target_item.child(0).data(0, 1000), AnimationClip): target_layer_item = target_item
+        if not target_layer_item: event.ignore(); return
+        if not is_copy and source_layer_item == target_layer_item: self.reorder_clips_in_layer(source_items, target_item, event)
+        else: self.move_or_copy_clips_to_layer(source_items, target_layer_item, is_copy, event)
+        self.parent_window.populate_animation_tree(); event.acceptProposedAction()
     def reorder_clips_in_layer(self, source_items, target_item, event):
-        layer_item = source_items[0].parent()
-        segment_name = layer_item.parent().text(0).replace("Segment: ", "").strip()
-        layer_name = layer_item.text(0).replace("  Layer: ", "").strip()
-        
-        clips_in_layer = self.get_layer_clips(segment_name, layer_name)
-        clips_in_layer.sort(key=lambda c: c.order_index)
-
-        dragged_clip_objs = [item.data(0, 1000) for item in source_items]
-        remaining_clips = [clip for clip in clips_in_layer if clip not in dragged_clip_objs]
-        
-        drop_pos_indicator = self.dropIndicatorPosition()
-        target_clip_obj = target_item.data(0, 1000) if isinstance(target_item.data(0, 1000), AnimationClip) else None
-
-        if target_clip_obj and target_clip_obj in remaining_clips:
-            target_index = remaining_clips.index(target_clip_obj)
-            if drop_pos_indicator == QAbstractItemView.DropIndicatorPosition.BelowItem:
-                target_index += 1
-        else: # Dropped on the layer item itself or empty space
-            target_index = len(remaining_clips)
-            
-        # Insert dragged clips at the target index
-        for clip_obj in reversed(dragged_clip_objs):
-            remaining_clips.insert(target_index, clip_obj)
-
-        # Re-assign order_index for all clips in the layer
-        for i, clip_obj in enumerate(remaining_clips):
-            clip_obj.order_index = i
-        
-        clip_names_str = ", ".join(f"'{c.name}'" for c in dragged_clip_objs)
-        self.parent_window.log_message(f"Reordered {len(dragged_clip_objs)} clip(s) within layer '{layer_name}' (Segment: '{segment_name}'): {clip_names_str}.")
-
+        layer_item = source_items[0].parent(); seg_name = layer_item.parent().text(0).replace("Segment: ", "").strip(); layer_name = layer_item.text(0).replace("  Layer: ", "").strip()
+        clips_in_layer = sorted(self.get_layer_clips(seg_name, layer_name), key=lambda c: c.order_index)
+        dragged_clips = [item.data(0, 1000) for item in source_items]; remaining_clips = [c for c in clips_in_layer if c not in dragged_clips]
+        drop_pos, target_clip = self.dropIndicatorPosition(), target_item.data(0, 1000) if isinstance(target_item.data(0, 1000), AnimationClip) else None
+        if target_clip and target_clip in remaining_clips:
+            target_idx = remaining_clips.index(target_clip)
+            if drop_pos == QAbstractItemView.DropIndicatorPosition.BelowItem: target_idx += 1
+        else: target_idx = len(remaining_clips)
+        for clip in reversed(dragged_clips): remaining_clips.insert(target_idx, clip)
+        for i, clip in enumerate(remaining_clips): clip.order_index = i
+        self.parent_window.log_message(f"Reordered {len(dragged_clips)} clip(s) in '{layer_name}'.")
     def move_or_copy_clips_to_layer(self, source_items, target_layer_item, is_copy, event):
-        source_layer_name = source_items[0].parent().text(0).replace("  Layer: ", "").strip()
-        source_segment_name = source_items[0].parent().parent().text(0).replace("Segment: ", "").strip()
-        
-        target_layer_name = target_layer_item.text(0).replace("  Layer: ", "").strip()
-        target_segment_item = target_layer_item.parent()
-        target_segment_name = target_segment_item.text(0).replace("Segment: ", "").strip()
-
-        source_fp_sig, source_c_sig = self.parent_window.tree.get_layer_target_signature(source_segment_name, source_layer_name, self.parent_window.animation_file)
-        
-        # If moving to a different segment, check for a compatible layer or create a new one
-        if source_segment_name != target_segment_name:
-            compatible_layer_name = None
-            for i in range(target_segment_item.childCount()):
-                layer_item = target_segment_item.child(i)
-                layer_name = layer_item.text(0).replace("  Layer: ", "").strip()
-                fp_sig, c_sig = self.parent_window.tree.get_layer_target_signature(target_segment_name, layer_name, self.parent_window.animation_file)
-                if fp_sig == source_fp_sig and c_sig == source_c_sig:
-                    compatible_layer_name = layer_name
-                    break
-            
-            if compatible_layer_name:
-                target_layer_name = compatible_layer_name
+        src_layer, src_seg = source_items[0].parent().text(0).replace("  Layer: ","").strip(), source_items[0].parent().parent().text(0).replace("Segment: ","").strip()
+        tgt_layer, tgt_seg = target_layer_item.text(0).replace("  Layer: ","").strip(), target_layer_item.parent().text(0).replace("Segment: ","").strip()
+        src_fp_sig, src_c_sig = self.get_layer_target_signature(src_seg, src_layer, self.parent_window.animation_file)
+        if src_seg != tgt_seg:
+            compat_layer = None
+            for i in range(target_layer_item.parent().childCount()):
+                layer_item = target_layer_item.parent().child(i); layer_name = layer_item.text(0).replace("  Layer: ","").strip()
+                fp_sig, c_sig = self.get_layer_target_signature(tgt_seg, layer_name, self.parent_window.animation_file)
+                if fp_sig == src_fp_sig and c_sig == src_c_sig: compat_layer = layer_name; break
+            if compat_layer: tgt_layer = compat_layer
             else:
-                # No compatible layer found, create a new one
-                new_layer_name = source_layer_name
-                existing_target_layer_names = {target_segment_item.child(i).text(0).replace("  Layer: ", "").strip() for i in range(target_segment_item.childCount())}
-                counter = 1
-                while new_layer_name in existing_target_layer_names:
-                    new_layer_name = f"{source_layer_name}_{counter}"
-                    counter += 1
-                target_layer_name = new_layer_name
-                self.parent_window.log_message(f"Created new layer '{target_layer_name}' in segment '{target_segment_name}' due to incompatible targets.")
-
-        clips_in_target_layer = self.get_layer_clips(target_segment_name, target_layer_name)
-        existing_names_in_target = {c.name for c in clips_in_target_layer}
-        max_order_index = max((c.order_index for c in clips_in_target_layer), default=-1)
-
-        for source_item in source_items:
-            source_clip_obj = source_item.data(0, 1000)
-            new_name = source_clip_obj.name
-            
-            if new_name in existing_names_in_target:
-                reply = QMessageBox.question(self, "Name Conflict", f"A clip named '{new_name}' already exists in the target layer. Replace it?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                new_layer, existing_layers, counter = src_layer, {target_layer_item.parent().child(i).text(0).replace("  Layer: ","").strip() for i in range(target_layer_item.parent().childCount())}, 1
+                while new_layer in existing_layers: new_layer = f"{src_layer}_{counter}"; counter += 1
+                tgt_layer = new_layer; self.parent_window.log_message(f"Created new layer '{tgt_layer}' in '{tgt_seg}'.")
+        clips_in_tgt = self.get_layer_clips(tgt_seg, tgt_layer); existing_names = {c.name for c in clips_in_tgt}; max_order = max((c.order_index for c in clips_in_tgt), default=-1)
+        for src_item in source_items:
+            src_clip = src_item.data(0, 1000); new_name = src_clip.name
+            if new_name in existing_names:
+                reply = QMessageBox.question(self, "Name Conflict", f"Clip '{new_name}' exists. Replace?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
                 if reply == QMessageBox.StandardButton.Yes:
-                    clip_to_remove = next((c for c in clips_in_target_layer if c.name == new_name), None)
-                    if clip_to_remove: self.parent_window.animation_file.clips.remove(clip_to_remove)
-                    self.parent_window.log_message(f"Replaced clip '{new_name}' in '{target_segment_name}/{target_layer_name}'.")
-                else: 
-                    self.parent_window.log_message(f"Skipped {'copy' if is_copy else 'move'} of clip '{new_name}' due to name conflict.")
-                    continue
-
-            max_order_index += 1
+                    to_remove = next(c for c in clips_in_tgt if c.name == new_name); self.parent_window.animation_file.clips.remove(to_remove)
+                else: self.parent_window.log_message(f"Skipped {'copy' if is_copy else 'move'} of '{new_name}'."); continue
+            max_order += 1
             if is_copy:
-                new_clip_obj = copy.deepcopy(source_clip_obj)
-                new_clip_obj.name = new_name
-                new_clip_obj.segment = target_segment_name
-                new_clip_obj.layer = target_layer_name
-                new_clip_obj.order_index = max_order_index
-                self.parent_window.animation_file.clips.append(new_clip_obj)
-                existing_names_in_target.add(new_name)
-                self.parent_window.log_message(f"Copied clip '{source_clip_obj.name}' to '{target_segment_name}/{target_layer_name}'.")
-
+                new_clip = copy.deepcopy(src_clip); new_clip.name, new_clip.segment, new_clip.layer, new_clip.order_index = new_name, tgt_seg, tgt_layer, max_order
+                self.parent_window.animation_file.clips.append(new_clip); existing_names.add(new_name); self.parent_window.log_message(f"Copied '{src_clip.name}' to '{tgt_seg}/{tgt_layer}'.")
             else:
-                self.parent_window.log_message(f"Moved clip '{source_clip_obj.name}' from '{source_segment_name}/{source_layer_name}' to '{target_segment_name}/{target_layer_name}'.")
-                source_clip_obj.name = new_name
-                source_clip_obj.segment = target_segment_name
-                source_clip_obj.layer = target_layer_name
-                source_clip_obj.order_index = max_order_index
-        
+                src_clip.name, src_clip.segment, src_clip.layer, src_clip.order_index = new_name, tgt_seg, tgt_layer, max_order; self.parent_window.log_message(f"Moved '{src_clip.name}' to '{tgt_seg}/{tgt_layer}'.")
     def open_context_menu(self, position):
-        menu = QMenu(self)
-        selected_items = self.selectedItems()
-
-        if selected_items:
-            item = selected_items[0]
-            # --- Single Item Actions ---
-            if len(selected_items) == 1:
-                rename_action = menu.addAction("Rename...")
-                rename_action.setShortcut("F2")
-                rename_action.triggered.connect(self.parent_window.rename_selected_item)
-
-                if item.parent() and item.parent().parent(): # Is a clip item
-                    duplicate_action = menu.addAction("Duplicate Clip")
-                    duplicate_action.setShortcut("Ctrl+D")
-                    duplicate_action.triggered.connect(self.parent_window.duplicate_selected_clip)
-
-            # --- Multi-Item Actions ---
-            # Action to delete any type of selected item (clip, layer, segment)
-            delete_action = menu.addAction(QIcon.fromTheme("edit-delete"), f"Delete {len(selected_items)} selected item(s)")
-            delete_action.setShortcut("Delete")
-            delete_action.triggered.connect(self.parent_window.delete_selected_items)
-        
-        if not menu.isEmpty():
-            menu.exec(self.viewport().mapToGlobal(position))
+        menu, selected = QMenu(self), self.selectedItems()
+        if selected:
+            if len(selected) == 1:
+                item = selected[0]
+                rename = menu.addAction("Rename..."); rename.setShortcut("F2"); rename.triggered.connect(self.parent_window.rename_selected_item)
+                if item.parent() and item.parent().parent():
+                    duplicate = menu.addAction("Duplicate Clip"); duplicate.setShortcut("Ctrl+D"); duplicate.triggered.connect(self.parent_window.duplicate_selected_clip)
+            delete = menu.addAction(QIcon.fromTheme("edit-delete"), f"Delete {len(selected)} item(s)"); delete.setShortcut("Delete"); delete.triggered.connect(self.parent_window.delete_selected_items)
+        if not menu.isEmpty(): menu.exec(self.viewport().mapToGlobal(position))
 
 class ClipPropertiesPanel(QWidget):
-    """A widget to display and edit properties of a selected AnimationClip."""
     def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
-        self.clip = None
-        self.current_tree_item = None
-        self.init_ui()
-        self.clear() # Initially hidden
-
+        super().__init__(); self.main_window = main_window; self.clip, self.current_tree_item = None, None; self.init_ui(); self.clear()
     def init_ui(self):
-        self.layout = QVBoxLayout(self)
-        self.form_layout = QFormLayout()
-
-        # Editable Name
-        self.name_edit = QLineEdit()
-        self.name_edit.editingFinished.connect(self.on_name_changed)
-        self.form_layout.addRow("Name:", self.name_edit)
-
-        self.layout.addLayout(self.form_layout)
-        
-        # General Info
-        self.layout.addWidget(QLabel("<b>General</b>"))
-        self.general_form_layout = QFormLayout()
-        self.segment_label = QLabel()
-        self.layer_label = QLabel()
-        self.length_label = QLabel()
-        self.loop_label = QLabel()
-        self.general_form_layout.addRow("Segment:", self.segment_label)
-        self.general_form_layout.addRow("Layer:", self.layer_label)
-        self.general_form_layout.addRow("Length:", self.length_label)
-        self.general_form_layout.addRow("Loop:", self.loop_label)
-        self.layout.addLayout(self.general_form_layout)
-
-        # Sequencing Info
-        self.layout.addWidget(QLabel("<b>Sequencing</b>"))
-        self.sequence_form_layout = QFormLayout()
-        self.next_anim_label = QLabel()
-        self.sequence_form_layout.addRow("Next Animation:", self.next_anim_label)
-        self.layout.addLayout(self.sequence_form_layout)
-
-        # Targets List
-        self.layout.addWidget(QLabel("<b>Targets</b>"))
-        self.targets_list = QListWidget()
-        self.layout.addWidget(self.targets_list)
-
-        self.layout.addStretch()
-
+        self.layout = QVBoxLayout(self); self.form_layout = QFormLayout(); self.name_edit = QLineEdit(); self.name_edit.editingFinished.connect(self.on_name_changed); self.form_layout.addRow("Name:", self.name_edit); self.layout.addLayout(self.form_layout)
+        self.layout.addWidget(QLabel("<b>General</b>")); self.general_form_layout = QFormLayout(); self.segment_label, self.layer_label, self.length_label, self.loop_label = QLabel(), QLabel(), QLabel(), QLabel()
+        self.general_form_layout.addRow("Segment:", self.segment_label); self.general_form_layout.addRow("Layer:", self.layer_label); self.general_form_layout.addRow("Length:", self.length_label); self.general_form_layout.addRow("Loop:", self.loop_label); self.layout.addLayout(self.general_form_layout)
+        self.layout.addWidget(QLabel("<b>Sequencing</b>")); self.sequence_form_layout = QFormLayout(); self.next_anim_label = QLabel(); self.sequence_form_layout.addRow("Next Animation:", self.next_anim_label); self.layout.addLayout(self.sequence_form_layout)
+        self.layout.addWidget(QLabel("<b>Targets</b>")); self.targets_list = QListWidget(); self.layout.addWidget(self.targets_list); self.layout.addStretch()
     def display_clip_properties(self, clip, item):
-        self.clip = clip
-        self.current_tree_item = item
-        
-        # Temporarily block signals to prevent on_name_changed from firing
-        self.name_edit.blockSignals(True)
-        self.name_edit.setText(clip.name)
-        self.name_edit.blockSignals(False)
-        
-        self.segment_label.setText(clip.segment)
-        self.layer_label.setText(clip.layer)
-        self.length_label.setText(f"{clip.length:.3f}s")
-        
-        is_loop = clip.other_properties.get('Loop', '0') == '1'
-        self.loop_label.setText("Yes" if is_loop else "No")
-        
-        next_anim = clip.other_properties.get('NextAnimationName', 'None')
-        self.next_anim_label.setText(next_anim)
-
-        self.targets_list.clear()
-        
-        targets = []
-        for controller in clip.controllers:
-            targets.append(f"[C] {controller.id}")
-        for param in clip.float_params:
-            targets.append(f"[F] {param.storable}/{param.name}")
-        
-        if targets:
-            self.targets_list.addItems(sorted(targets))
-        else:
-            self.targets_list.addItem("No targets in this clip.")
-
+        self.clip, self.current_tree_item = clip, item; self.name_edit.blockSignals(True); self.name_edit.setText(clip.name); self.name_edit.blockSignals(False)
+        self.segment_label.setText(clip.segment); self.layer_label.setText(clip.layer); self.length_label.setText(f"{clip.length:.3f}s")
+        self.loop_label.setText("Yes" if clip.other_properties.get('Loop', '0') == '1' else "No"); self.next_anim_label.setText(clip.other_properties.get('NextAnimationName', 'None')); self.targets_list.clear()
+        targets = [f"[C] {c.id}" for c in clip.controllers] + [f"[F] {p.storable}/{p.name}" for p in clip.float_params]
+        if targets: self.targets_list.addItems(sorted(targets))
+        else: self.targets_list.addItem("No targets in this clip.")
         self.show()
-
     def on_name_changed(self):
-        if not self.clip: return
-        self.main_window.update_clip_name(
-            self.clip, self.current_tree_item, self.name_edit.text()
-        )
-
-    def clear(self):
-        self.clip = None
-        self.current_tree_item = None
-        self.hide()
+        if self.clip: self.main_window.update_clip_name(self.clip, self.current_tree_item, self.name_edit.text())
+    def clear(self): self.clip, self.current_tree_item = None, None; self.hide()
 
 # --- 4. Main Application Window ---
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__()
-        self.animation_file = None
-        self.current_file_path = None
-        self.setWindowTitle("Timeliner")
+        super().__init__(); self.animation_file, self.current_file_path = None, None; self.setWindowTitle("Timeliner")
         ico_path = os.path.join(getattr(sys, '_MEIPASS', os.path.abspath('.')), 'Timeliner.ico')
-        self.setWindowIcon(QIcon(ico_path))
-        self.setGeometry(100, 100, 1200, 800)
-
-        # --- Load settings ---
-        self.settings = QSettings("VamTimelineTools", "TimelinerEditor")
-        self.last_directory = self.settings.value("last_directory", "")
-
-        self.init_ui()
+        if os.path.exists(ico_path): self.setWindowIcon(QIcon(ico_path))
+        self.setGeometry(100, 100, 1200, 800); self.settings = QSettings("VamTimelineTools", "TimelinerEditor"); self.last_directory = self.settings.value("last_directory", ""); self.init_ui()
 
     def init_ui(self):
-        # --- Actions ---
-        open_action = QAction(QIcon.fromTheme("document-open"), "&Open...", self)
-        open_action.triggered.connect(self.open_file)
-
-        save_as_action = QAction(QIcon.fromTheme("document-save-as"), "&Save As...", self)
-        save_as_action.triggered.connect(self.save_file_as)
-
-        exit_action = QAction("E&xit", self)
-        exit_action.triggered.connect(self.close)
-
-        new_segment_action = QAction(QIcon.fromTheme("list-add"), "New &Segment...", self)
-        new_segment_action.triggered.connect(self.create_new_segment)
-        
-        rename_action = QAction(QIcon.fromTheme("edit-rename"), "Re&name...", self)
-        rename_action.setShortcut("F2")
-        rename_action.triggered.connect(self.rename_selected_item)
-
-        batch_rename_action = QAction("Change Names in &Batch...", self)
-        batch_rename_action.triggered.connect(self.batch_rename_items)
-
-        delete_action = QAction(QIcon.fromTheme("edit-delete"), "&Delete Selected", self)
-        delete_action.setShortcut("Delete")
-        delete_action.triggered.connect(self.delete_selected_items)
-
-        duplicate_action = QAction(QIcon.fromTheme("edit-copy"), "&Duplicate Clip", self)
-        duplicate_action.setShortcut("Ctrl+D")
-        duplicate_action.triggered.connect(self.duplicate_selected_clip)
-
-        # --- Menu Bar ---
-        menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("&File")
-        file_menu.addAction(open_action)
-        file_menu.addAction(save_as_action)
-        file_menu.addSeparator()
-        file_menu.addAction(new_segment_action)
-        file_menu.addSeparator()
-        file_menu.addAction(exit_action)
-        
-        edit_menu = menu_bar.addMenu("&Edit")
-        edit_menu.addAction(rename_action)
-        edit_menu.addAction(batch_rename_action)
-        edit_menu.addAction(duplicate_action)
-        edit_menu.addSeparator()
-        edit_menu.addAction(delete_action)
-        
-        # --- Toolbar ---
-        toolbar = self.addToolBar("Main Toolbar")
-        toolbar.addAction(open_action)
-        toolbar.addAction(save_as_action)
-        toolbar.addSeparator()
-        toolbar.addAction(new_segment_action)
-        toolbar.addAction(delete_action)
-        
-        # --- Main Layout ---
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
-        
-        # Left Panel (Tree)
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_panel.setFixedWidth(400)
-
-        # --- Filter and Control Buttons Layout ---
-        filter_layout = QHBoxLayout()
-        self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("Filter animations...")
-        self.filter_edit.textChanged.connect(self.filter_tree)
-        filter_layout.addWidget(self.filter_edit)
-        
-        self.fold_all_button = QPushButton("Fold All")
-        self.fold_all_button.clicked.connect(self.fold_all_items)
-        filter_layout.addWidget(self.fold_all_button)
-        
-        self.unfold_all_button = QPushButton("Unfold All")
-        self.unfold_all_button.clicked.connect(self.unfold_all_items)
-        filter_layout.addWidget(self.unfold_all_button)
-        
+        open_action=QAction(QIcon.fromTheme("document-open"),"&Open...",self);open_action.triggered.connect(self.open_file)
+        save_as_action=QAction(QIcon.fromTheme("document-save-as"),"&Save As...",self);save_as_action.triggered.connect(self.save_file_as)
+        exit_action=QAction("E&xit",self);exit_action.triggered.connect(self.close)
+        new_segment_action=QAction(QIcon.fromTheme("list-add"),"New &Segment...",self);new_segment_action.triggered.connect(self.create_new_segment)
+        rename_action=QAction(QIcon.fromTheme("edit-rename"),"Re&name...",self);rename_action.setShortcut("F2");rename_action.triggered.connect(self.rename_selected_item)
+        batch_rename_action=QAction("Change Names in &Batch...",self);batch_rename_action.triggered.connect(self.batch_rename_items)
+        delete_action=QAction(QIcon.fromTheme("edit-delete"),"&Delete Selected",self);delete_action.setShortcut("Delete");delete_action.triggered.connect(self.delete_selected_items)
+        duplicate_action=QAction(QIcon.fromTheme("edit-copy"),"&Duplicate Clip",self);duplicate_action.setShortcut("Ctrl+D");duplicate_action.triggered.connect(self.duplicate_selected_clip)
+        center_root_action=QAction("Center &Root on First Frame",self);center_root_action.triggered.connect(self.center_root_on_first_frame)
+        menu_bar=self.menuBar();file_menu=menu_bar.addMenu("&File");file_menu.addAction(open_action);file_menu.addAction(save_as_action);file_menu.addSeparator();file_menu.addAction(new_segment_action);file_menu.addSeparator();file_menu.addAction(exit_action)
+        edit_menu=menu_bar.addMenu("&Edit");edit_menu.addAction(rename_action);edit_menu.addAction(batch_rename_action);edit_menu.addAction(duplicate_action);edit_menu.addSeparator();edit_menu.addAction(center_root_action);edit_menu.addSeparator();edit_menu.addAction(delete_action)
+        toolbar=self.addToolBar("Main Toolbar");toolbar.addAction(open_action);toolbar.addAction(save_as_action);toolbar.addSeparator();toolbar.addAction(new_segment_action);toolbar.addAction(delete_action)
+        main_widget=QWidget();self.setCentralWidget(main_widget);main_layout=QHBoxLayout(main_widget)
+        left_panel=QWidget();left_layout=QVBoxLayout(left_panel);left_panel.setFixedWidth(400);filter_layout=QHBoxLayout();self.filter_edit=QLineEdit();self.filter_edit.setPlaceholderText("Filter animations...");self.filter_edit.textChanged.connect(self.filter_tree);filter_layout.addWidget(self.filter_edit)
+        self.fold_all_button=QPushButton("Fold All");self.fold_all_button.clicked.connect(self.fold_all_items);filter_layout.addWidget(self.fold_all_button)
+        self.unfold_all_button=QPushButton("Unfold All");self.unfold_all_button.clicked.connect(self.unfold_all_items);filter_layout.addWidget(self.unfold_all_button)
         left_layout.addLayout(filter_layout)
-        
-        self.tree = AnimationTreeWidget(self)
-        self.tree.setHeaderLabels(["Segment / Layer / Animation"])
-        self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
-        self.tree.itemChanged.connect(self.on_item_renamed)
-        left_layout.addWidget(self.tree)
-        
-        # Right Panel (Properties and Log)
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        
-        self.placeholder_label = QLabel("Select a clip to see its properties.")
-        self.placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        self.properties_panel = ClipPropertiesPanel(self)
-        
-        self.log_console = QPlainTextEdit()
-        self.log_console.setReadOnly(True)
-        self.log_console.setFixedHeight(150)
-        self.log_console.setStyleSheet("background-color: #f0f0f0; font-family: Consolas, monospace;")
-        
-        right_layout.addWidget(self.placeholder_label)
-        right_layout.addWidget(self.properties_panel)
-        right_layout.addStretch(1) # Add stretch factor to push log to bottom
-        right_layout.addWidget(QLabel("<b>Console Log</b>"))
-        right_layout.addWidget(self.log_console)
-        
-        main_layout.addWidget(left_panel)
-        main_layout.addWidget(right_panel)
-        
+        self.tree=AnimationTreeWidget(self);self.tree.setHeaderLabels(["Segment / Layer / Animation"]);self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed);self.tree.itemChanged.connect(self.on_item_renamed);left_layout.addWidget(self.tree)
+        right_panel=QWidget();right_layout=QVBoxLayout(right_panel)
+        self.placeholder_label=QLabel("Select a clip to see its properties.");self.placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.properties_panel=ClipPropertiesPanel(self)
+        self.log_console=QPlainTextEdit();self.log_console.setReadOnly(True);self.log_console.setFixedHeight(150);self.log_console.setStyleSheet("background-color: #f0f0f0; font-family: Consolas, monospace;")
+        right_layout.addWidget(self.placeholder_label);right_layout.addWidget(self.properties_panel);right_layout.addStretch(1);right_layout.addWidget(QLabel("<b>Console Log</b>"));right_layout.addWidget(self.log_console)
+        main_layout.addWidget(left_panel);main_layout.addWidget(right_panel)
         self.log_message("Application started.")
 
     def get_tree_collapse_state(self):
-        """
-        Saves the state of COLLAPSED items. This implements an "open by default" policy.
-        """
         state = set()
         for i in range(self.tree.topLevelItemCount()):
-            segment_item = self.tree.topLevelItem(i)
-            segment_key = segment_item.text(0)
-            if not segment_item.isExpanded():
-                state.add(segment_key)
+            seg_item = self.tree.topLevelItem(i); seg_key = seg_item.text(0)
+            if not seg_item.isExpanded(): state.add(seg_key)
             else:
-                for j in range(segment_item.childCount()):
-                    layer_item = segment_item.child(j)
-                    if not layer_item.isExpanded():
-                        layer_key = f"{segment_key}::{layer_item.text(0)}"
-                        state.add(layer_key)
+                for j in range(seg_item.childCount()):
+                    layer_item = seg_item.child(j)
+                    if not layer_item.isExpanded(): state.add(f"{seg_key}::{layer_item.text(0)}")
         return state
 
     def fold_all_items(self):
-        """Collapses all items in the tree view."""
-        if self.tree:
-            self.tree.collapseAll()
-            self.log_message("All items folded.")
-
+        if self.tree: self.tree.collapseAll(); self.log_message("All items folded.")
     def unfold_all_items(self):
-        """Expands all items in the tree view."""
-        if self.tree:
-            self.tree.expandAll()
-            self.log_message("All items unfolded.")
-
+        if self.tree: self.tree.expandAll(); self.log_message("All items unfolded.")
     def log_message(self, message):
-        """Appends a timestamped message to the console log."""
-        timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
-        self.log_console.appendPlainText(f"[{timestamp}] {message}")
+        timestamp = QDateTime.currentDateTime().toString("hh:mm:ss"); self.log_console.appendPlainText(f"[{timestamp}] {message}")
 
     def on_tree_selection_changed(self):
-        selected_items = self.tree.selectedItems()
-        if selected_items:
-            item = selected_items[0]
-            clip_data = item.data(0, 1000)
-            if isinstance(clip_data, AnimationClip):
-                self.properties_panel.display_clip_properties(clip_data, item)
-                self.placeholder_label.hide()
-            else:
-                self.properties_panel.clear()
-                self.placeholder_label.show()
-        else:
-            self.properties_panel.clear()
-            self.placeholder_label.show()
+        selected = self.tree.selectedItems()
+        if selected and isinstance(selected[0].data(0, 1000), AnimationClip):
+            self.properties_panel.display_clip_properties(selected[0].data(0, 1000), selected[0]); self.placeholder_label.hide()
+        else: self.properties_panel.clear(); self.placeholder_label.show()
 
     def filter_tree(self, text):
-        """Filters the tree based on the input text."""
-        search_text = text.lower()
-        is_filtering = bool(search_text)
-        
-        # Don't do anything if the tree is empty
-        if self.tree.topLevelItemCount() == 0:
-            return
-
-        # When filtering, expand matching nodes.
+        search_text = text.lower(); is_filtering = bool(search_text)
+        if self.tree.topLevelItemCount() == 0: return
         if is_filtering:
             for i in range(self.tree.topLevelItemCount()):
-                segment_item = self.tree.topLevelItem(i)
-                segment_visible = False
-                for j in range(segment_item.childCount()):
-                    layer_item = segment_item.child(j)
-                    layer_visible = False
+                seg_item = self.tree.topLevelItem(i); seg_visible = False
+                for j in range(seg_item.childCount()):
+                    layer_item = seg_item.child(j); layer_visible = False
                     for k in range(layer_item.childCount()):
                         clip_item = layer_item.child(k)
-                        if search_text in clip_item.text(0).lower():
-                            clip_item.setHidden(False)
-                            layer_visible = True
-                        else:
-                            clip_item.setHidden(True)
-                    
-                    if layer_visible or search_text in layer_item.text(0).lower():
-                        layer_item.setHidden(False)
-                        segment_visible = True
-                        layer_item.setExpanded(True)
-                    else:
-                        layer_item.setHidden(True)
-
-                if segment_visible or search_text in segment_item.text(0).lower():
-                    segment_item.setHidden(False)
-                    segment_item.setExpanded(True)
-                else:
-                    segment_item.setHidden(True)
-        else:
-            # When filter is cleared, restore visibility and saved collapse state.
-            self.populate_animation_tree()
+                        if search_text in clip_item.text(0).lower(): clip_item.setHidden(False); layer_visible = True
+                        else: clip_item.setHidden(True)
+                    if layer_visible or search_text in layer_item.text(0).lower(): layer_item.setHidden(False); seg_visible = True; layer_item.setExpanded(True)
+                    else: layer_item.setHidden(True)
+                if seg_visible or search_text in seg_item.text(0).lower(): seg_item.setHidden(False); seg_item.setExpanded(True)
+                else: seg_item.setHidden(True)
+        else: self.populate_animation_tree()
 
     def open_file(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Open Animation File", self.last_directory, "JSON Files (*.json)")
-        if not file_name:
-            return
-
+        if not file_name: return
         if self.animation_file:
-            msg_box = QMessageBox(self)
-            msg_box.setIcon(QMessageBox.Icon.Question)
-            msg_box.setText("An animation file is already open.")
-            msg_box.setInformativeText("How would you like to open the new file?")
-            merge_button = msg_box.addButton("Merge", QMessageBox.ButtonRole.ActionRole)
-            replace_button = msg_box.addButton("Replace", QMessageBox.ButtonRole.ActionRole)
-            msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            msg_box.exec()
-
-            if msg_box.clickedButton() == merge_button:
-                self.merge_animation_files(file_name)
-            elif msg_box.clickedButton() == replace_button:
-                self.load_file(file_name, is_first_load=True)
-            else: # Cancel
-                return
-        else:
-            self.load_file(file_name, is_first_load=True)
+            msg_box = QMessageBox(self); msg_box.setIcon(QMessageBox.Icon.Question); msg_box.setText("File is already open."); msg_box.setInformativeText("Merge or Replace?")
+            merge_btn, replace_btn = msg_box.addButton("Merge", QMessageBox.ButtonRole.ActionRole), msg_box.addButton("Replace", QMessageBox.ButtonRole.ActionRole)
+            msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole); msg_box.exec()
+            if msg_box.clickedButton() == merge_btn: self.merge_animation_files(file_name)
+            elif msg_box.clickedButton() == replace_btn: self.load_file(file_name, is_first_load=True)
+            else: return
+        else: self.load_file(file_name, is_first_load=True)
             
     def load_file(self, file_name, is_first_load=False):
         try:
-            with open(file_name, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            self.animation_file = AnimationFile.from_dict(data)
-            self.current_file_path = file_name
-            self.populate_animation_tree(is_first_load=is_first_load)
-            self.setWindowTitle(f"Timeliner - {file_name}")
-            self.log_message(f"File loaded: {file_name}")
-            
-            # --- Remember last directory ---
-            self.last_directory = os.path.dirname(file_name)
-            self.settings.setValue("last_directory", self.last_directory)
-
+            with open(file_name, 'r', encoding='utf-8') as f: data = json.load(f)
+            self.animation_file = AnimationFile.from_dict(data); self.current_file_path = file_name
+            self.populate_animation_tree(is_first_load=is_first_load); self.setWindowTitle(f"Timeliner - {file_name}"); self.log_message(f"Loaded: {file_name}")
+            self.last_directory = os.path.dirname(file_name); self.settings.setValue("last_directory", self.last_directory)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Error loading file: {e}")
-            self.log_message(f"ERROR: Failed to load file '{file_name}'. Reason: {e}")
-            self.animation_file = None
-            self.current_file_path = None
-            self.tree.clear()
+            QMessageBox.critical(self, "Error", f"Error loading file: {e}"); self.log_message(f"ERROR loading '{file_name}': {e}")
+            self.animation_file = None; self.current_file_path = None; self.tree.clear()
 
-    def merge_animation_files(self, source_file_path):
-        self.log_message(f"Attempting to merge file: {source_file_path}")
+    def merge_animation_files(self, source_path):
+        self.log_message(f"Merging: {source_path}")
         try:
-            with open(source_file_path, 'r', encoding='utf-8') as f:
-                source_data = json.load(f)
-            source_anim_file = AnimationFile.from_dict(source_data)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Could not read the source file for merging: {e}")
-            self.log_message(f"ERROR: Merge failed. Could not read source file. Reason: {e}")
-            return
-
-        # --- 1. Validate compatibility ---
-        if self.animation_file.atom_type != source_anim_file.atom_type:
-            QMessageBox.critical(self, "Merge Error", f"Cannot merge files with different Atom Types.\n\nCurrent: {self.animation_file.atom_type}\nSource: {source_anim_file.atom_type}")
-            self.log_message("ERROR: Merge failed. Mismatched AtomType.")
-            return
-
-        # --- 2. Ask user how to handle conflicts ---
-        conflict_dialog = MergeConflictDialog(self)
-        if not conflict_dialog.exec():
-            self.log_message("Merge cancelled by user.")
-            return
-        conflict_strategy = conflict_dialog.get_selected_strategy()
-
-        # --- 3. Perform the merge ---
-        self.log_message(f"Starting merge with conflict strategy: {conflict_strategy}")
-        added_clips_count = 0
+            with open(source_path, 'r', encoding='utf-8') as f: source_data = json.load(f)
+            source_anim = AnimationFile.from_dict(source_data)
+        except Exception as e: QMessageBox.critical(self, "Error", f"Read failed: {e}"); self.log_message(f"ERROR: Merge failed: {e}"); return
+        if self.animation_file.atom_type != source_anim.atom_type:
+            QMessageBox.critical(self, "Merge Error", f"Mismatched Atom Types.\nCurrent: {self.animation_file.atom_type}\nSource: {source_anim.atom_type}"); self.log_message("ERROR: Merge failed. Mismatched AtomType."); return
+        conflict_dialog = MergeConflictDialog(self);
+        if not conflict_dialog.exec(): self.log_message("Merge cancelled."); return
+        strategy = conflict_dialog.get_selected_strategy()
+        self.log_message(f"Merge strategy: {strategy}")
+        added_count = 0; source_grouped = defaultdict(lambda: defaultdict(list))
+        for clip in source_anim.clips: source_grouped[clip.segment][clip.layer].append(clip)
+        max_order = max((c.order_index for c in self.animation_file.clips), default=-1)
+        for seg, layers in source_grouped.items():
+            for layer, clips in layers.items():
+                s_fp_sig, s_c_sig = self.tree.get_layer_target_signature(seg, layer, source_anim)
+                target_seg, target_layer = seg, layer
+                target_layers_in_seg = {c.layer for c in self.animation_file.clips if c.segment == target_seg}
+                compat_found = False
+                for existing_layer in target_layers_in_seg:
+                    fp_sig, c_sig = self.tree.get_layer_target_signature(target_seg, existing_layer, self.animation_file)
+                    if fp_sig == s_fp_sig and c_sig == s_c_sig: target_layer, compat_found = existing_layer, True; break
+                if not compat_found:
+                    counter = 1; new_layer = layer
+                    while new_layer in target_layers_in_seg: new_layer = f"{layer}_{counter}"; counter += 1
+                    target_layer = new_layer; self.log_message(f"Created new layer '{target_layer}' in '{target_seg}'.")
+                existing_names = {c.name for c in self.animation_file.clips if c.segment==target_seg and c.layer==target_layer}
+                for clip in clips:
+                    is_conflict = clip.name in existing_names
+                    if is_conflict and strategy == "skip": self.log_message(f"Skipping '{clip.name}' due to conflict."); continue
+                    new_clip = copy.deepcopy(clip); new_clip.segment, new_clip.layer = target_seg, target_layer
+                    if is_conflict and strategy == "replace":
+                        to_remove = next(c for c in self.animation_file.clips if c.segment==target_seg and c.layer==target_layer and c.name==clip.name)
+                        self.animation_file.clips.remove(to_remove); self.log_message(f"Replacing clip '{clip.name}'.")
+                    elif is_conflict and strategy == "rename":
+                        base, i = clip.name, 1; new_name = f"{base}_merged"
+                        while new_name in existing_names: new_name = f"{base}_merged_{i}"; i += 1
+                        new_clip.name = new_name; self.log_message(f"Renaming '{clip.name}' to '{new_clip.name}'.")
+                    max_order += 1; new_clip.order_index = max_order
+                    self.animation_file.clips.append(new_clip); existing_names.add(new_clip.name); added_count += 1
         
-        # Group source clips for easier processing
-        source_grouped_clips = defaultdict(lambda: defaultdict(list))
-        for clip in source_anim_file.clips:
-            source_grouped_clips[clip.segment][clip.layer].append(clip)
-            
-        max_order_index = max((c.order_index for c in self.animation_file.clips), default=-1)
-
-        for segment_name, layers in source_grouped_clips.items():
-            for layer_name, source_clips in layers.items():
-                source_fp_sig, source_c_sig = self.tree.get_layer_target_signature(segment_name, layer_name, source_anim_file)
-                
-                # Find compatible target layer
-                target_segment_name = segment_name
-                target_layer_name = layer_name
-                
-                # Check for existing compatible layer in target file
-                target_layers_in_segment = {c.layer for c in self.animation_file.clips if c.segment == target_segment_name}
-                compatible_layer_found = False
-                for existing_layer_name in target_layers_in_segment:
-                    fp_sig, c_sig = self.tree.get_layer_target_signature(target_segment_name, existing_layer_name, self.animation_file)
-                    if fp_sig == source_fp_sig and c_sig == source_c_sig:
-                        target_layer_name = existing_layer_name
-                        compatible_layer_found = True
-                        break
-                
-                if not compatible_layer_found:
-                    # No compatible layer, create a new one. Ensure unique name.
-                    counter = 1
-                    new_layer_name = layer_name
-                    while new_layer_name in target_layers_in_segment:
-                        new_layer_name = f"{layer_name}_{counter}"
-                        counter += 1
-                    target_layer_name = new_layer_name
-                    self.log_message(f"Created new layer '{target_layer_name}' in segment '{target_segment_name}' for merged clips.")
-
-                # Get existing names in the final target layer
-                existing_names_in_target_layer = {c.name for c in self.animation_file.clips if c.segment == target_segment_name and c.layer == target_layer_name}
-
-                for source_clip in source_clips:
-                    is_conflict = source_clip.name in existing_names_in_target_layer
-                    
-                    if is_conflict and conflict_strategy == "skip":
-                        self.log_message(f"Skipping clip '{source_clip.name}' due to name conflict.")
-                        continue
-                        
-                    new_clip = copy.deepcopy(source_clip)
-                    new_clip.segment = target_segment_name
-                    new_clip.layer = target_layer_name
-                    
-                    if is_conflict and conflict_strategy == "replace":
-                        # Remove the old clip
-                        clip_to_remove = next(c for c in self.animation_file.clips if c.segment == target_segment_name and c.layer == target_layer_name and c.name == source_clip.name)
-                        self.animation_file.clips.remove(clip_to_remove)
-                        self.log_message(f"Replacing clip '{source_clip.name}' in '{target_segment_name}/{target_layer_name}'.")
-                    elif is_conflict and conflict_strategy == "rename":
-                        base_name = source_clip.name
-                        counter = 1
-                        new_name = f"{base_name}_merged"
-                        while new_name in existing_names_in_target_layer:
-                             new_name = f"{base_name}_merged_{counter}"
-                             counter += 1
-                        new_clip.name = new_name
-                        self.log_message(f"Renaming conflicting clip '{source_clip.name}' to '{new_clip.name}'.")
-                    
-                    max_order_index += 1
-                    new_clip.order_index = max_order_index
-                    self.animation_file.clips.append(new_clip)
-                    existing_names_in_target_layer.add(new_clip.name)
-                    added_clips_count += 1
-        
-        self.log_message(f"Merge complete. Added {added_clips_count} clip(s) to the project.")
-        # Mark the current file as unsaved by clearing the path
-        if self.current_file_path:
-            self.setWindowTitle(self.windowTitle() + " *")
-            self.current_file_path = None
-        
+        self.log_message(f"Merge complete. Added {added_count} clip(s).")
+        if self.current_file_path: self.setWindowTitle(self.windowTitle() + " *"); self.current_file_path = None
         self.populate_animation_tree()
 
     def save_file_as(self):
-        if not self.animation_file: 
-            self.log_message("Save cancelled: No animation data loaded.")
-            return
-            
+        if not self.animation_file: self.log_message("Save cancelled: No data loaded."); return
         start_path = self.last_directory or self.current_file_path or ""
-        file_name, _ = QFileDialog.getSaveFileName(self, "Save Animation File As", start_path, "JSON Files (*.json)")
-        
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save As", start_path, "JSON Files (*.json)")
         if file_name:
-            if not file_name.lower().endswith('.json'):
-                file_name += '.json'
+            if not file_name.lower().endswith('.json'): file_name += '.json'
             try:
-                with open(file_name, 'w', encoding='utf-8') as f:
-                    json.dump(self.animation_file.to_dict(), f, indent=3, ensure_ascii=False)
-                self.current_file_path = file_name
-                self.setWindowTitle(f"Timeliner - {file_name}")
-                self.log_message(f"File saved as: {file_name}")
-                
-                # --- Remember last directory ---
-                self.last_directory = os.path.dirname(file_name)
-                self.settings.setValue("last_directory", self.last_directory)
-
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Error saving file: {e}")
-                self.log_message(f"ERROR: Failed to save file. Reason: {e}")
+                with open(file_name, 'w', encoding='utf-8') as f: json.dump(self.animation_file.to_dict(), f, indent=3, ensure_ascii=False)
+                self.current_file_path = file_name; self.setWindowTitle(f"Timeliner - {file_name}"); self.log_message(f"File saved: {file_name}")
+                self.last_directory = os.path.dirname(file_name); self.settings.setValue("last_directory", self.last_directory)
+            except Exception as e: QMessageBox.critical(self, "Error", f"Save failed: {e}"); self.log_message(f"ERROR: Save failed. Reason: {e}")
 
     def populate_animation_tree(self, is_first_load=False):
         self.tree.itemSelectionChanged.disconnect(self.on_tree_selection_changed)
-        
         collapse_state = {} if is_first_load else self.get_tree_collapse_state()
-                        
-        self.tree.clear()
-        if not self.animation_file: 
-            self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
-            return
-
-        grouped_clips = defaultdict(lambda: defaultdict(list))
-        for clip in self.animation_file.clips:
-            grouped_clips[clip.segment][clip.layer].append(clip)
-
-        for segment_name in sorted(grouped_clips.keys()):
-            layers = grouped_clips[segment_name]
-            segment_item = QTreeWidgetItem(self.tree, [f"Segment: {segment_name}"])
-            segment_item.setData(0, 1000, "segment")
-            segment_item.setFlags(segment_item.flags() | Qt.ItemFlag.ItemIsEditable)
-            segment_key = segment_item.text(0)
-            segment_item.setExpanded(segment_key not in collapse_state)
-            
+        self.tree.clear();
+        if not self.animation_file: self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed); return
+        grouped = defaultdict(lambda: defaultdict(list))
+        for clip in self.animation_file.clips: grouped[clip.segment][clip.layer].append(clip)
+        for seg_name in sorted(grouped.keys()):
+            layers = grouped[seg_name]; seg_item = QTreeWidgetItem(self.tree, [f"Segment: {seg_name}"]); seg_item.setData(0, 1000, "segment")
+            seg_item.setFlags(seg_item.flags() | Qt.ItemFlag.ItemIsEditable); seg_key = seg_item.text(0); seg_item.setExpanded(seg_key not in collapse_state)
             for layer_name in sorted(layers.keys()):
-                clips = layers[layer_name]
-                layer_item = QTreeWidgetItem(segment_item, [f"  Layer: {layer_name}"])
-                layer_item.setData(0, 1000, "layer")
-                layer_item.setFlags(layer_item.flags() | Qt.ItemFlag.ItemIsEditable)
-                layer_key = f"{segment_key}::{layer_item.text(0)}"
-                layer_item.setExpanded(layer_key not in collapse_state)
-                
+                clips = layers[layer_name]; layer_item = QTreeWidgetItem(seg_item, [f"  Layer: {layer_name}"]); layer_item.setData(0, 1000, "layer")
+                layer_item.setFlags(layer_item.flags() | Qt.ItemFlag.ItemIsEditable); layer_key = f"{seg_key}::{layer_item.text(0)}"; layer_item.setExpanded(layer_key not in collapse_state)
                 clips.sort(key=lambda c: c.order_index)
                 for clip_obj in clips:
-                    clip_item = QTreeWidgetItem(layer_item, [f"    Clip: {clip_obj.name}"])
-                    clip_item.setData(0, 1000, clip_obj)
-                    clip_item.setFlags(clip_item.flags() | Qt.ItemFlag.ItemIsEditable)
-        
+                    clip_item = QTreeWidgetItem(layer_item, [f"    Clip: {clip_obj.name}"]); clip_item.setData(0, 1000, clip_obj); clip_item.setFlags(clip_item.flags() | Qt.ItemFlag.ItemIsEditable)
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
 
     def create_new_segment(self):
-        if not self.animation_file: 
-            self.log_message("Action failed: No animation data loaded to add a segment to.")
-            return
-            
-        text, ok = QInputDialog.getText(self, 'New Segment', 'Enter a name for the new segment:')
+        if not self.animation_file: self.log_message("Action failed: No data loaded."); return
+        text, ok = QInputDialog.getText(self, 'New Segment', 'Enter segment name:')
         if ok and text:
-            existing_segments = {c.segment for c in self.animation_file.clips}
-            if text in existing_segments:
-                QMessageBox.warning(self, "Name Conflict", f"A segment named '{text}' already exists.")
-                return
-
+            if any(c.segment == text for c in self.animation_file.clips): QMessageBox.warning(self, "Name Conflict", f"Segment '{text}' already exists."); return
             max_order = max((c.order_index for c in self.animation_file.clips), default=-1)
-            self.animation_file.clips.append(AnimationClip(
-                name="New Animation", segment=text, layer="Main", length=1.0, order_index=max_order + 1))
-            self.log_message(f"Created new segment '{text}' with a default clip 'New Animation'.")
-            self.populate_animation_tree()
+            self.animation_file.clips.append(AnimationClip(name="New Animation", segment=text, layer="Main", length=1.0, order_index=max_order + 1))
+            self.log_message(f"Created segment '{text}'."); self.populate_animation_tree()
 
     def delete_selected_items(self):
-        selected_items = self.tree.selectedItems()
-        if not selected_items: return
-
-        # Identify what to delete
-        segments_to_delete = set()
-        layers_to_delete = set() # as (segment_name, layer_name) tuples
-        clips_to_delete = set()
-
-        for item in selected_items:
+        selected = self.tree.selectedItems();
+        if not selected: return
+        segs, layers, clips = set(), set(), set()
+        for item in selected:
             item_type = item.data(0, 1000)
-            if item_type == "segment":
-                segments_to_delete.add(item.text(0).replace("Segment: ", "").strip())
-            elif item_type == "layer":
-                layer_name = item.text(0).replace("  Layer: ", "").strip()
-                segment_name = item.parent().text(0).replace("Segment: ", "").strip()
-                layers_to_delete.add((segment_name, layer_name))
-            elif isinstance(item_type, AnimationClip):
-                clips_to_delete.add(item_type)
-
-        if not any([segments_to_delete, layers_to_delete, clips_to_delete]):
-            return
-
-        reply = QMessageBox.question(self, 'Confirm Deletion',
-                                     f"Are you sure you want to delete the selected item(s) and all their contents?",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
-        
+            if item_type == "segment": segs.add(item.text(0).replace("Segment: ", "").strip())
+            elif item_type == "layer": layers.add((item.parent().text(0).replace("Segment: ", "").strip(), item.text(0).replace("  Layer: ", "").strip()))
+            elif isinstance(item_type, AnimationClip): clips.add(item_type)
+        if not any([segs, layers, clips]): return
+        reply = QMessageBox.question(self, 'Confirm Deletion', "Delete selected item(s)?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
-            initial_clip_count = len(self.animation_file.clips)
-            
-            # Build a list of clips to keep
-            clips_to_keep = []
-            for c in self.animation_file.clips:
-                if c in clips_to_delete:
-                    continue
-                if c.segment in segments_to_delete:
-                    continue
-                if (c.segment, c.layer) in layers_to_delete:
-                    continue
-                clips_to_keep.append(c)
-
-            self.animation_file.clips = clips_to_keep
-            deleted_count = initial_clip_count - len(clips_to_keep)
-            self.log_message(f"Deleted {deleted_count} clip(s) as part of deleting selected segments/layers/clips.")
-            self.populate_animation_tree()
+            initial = len(self.animation_file.clips)
+            self.animation_file.clips = [c for c in self.animation_file.clips if c not in clips and c.segment not in segs and (c.segment, c.layer) not in layers]
+            self.log_message(f"Deleted {initial - len(self.animation_file.clips)} clip(s)."); self.populate_animation_tree()
             
     def rename_selected_item(self):
-        if not self.tree.currentItem(): return
-        self.tree.editItem(self.tree.currentItem(), 0)
+        if self.tree.currentItem(): self.tree.editItem(self.tree.currentItem(), 0)
 
-    def on_item_renamed(self, item, column):
+    def on_item_renamed(self, item, col):
         item_type = item.data(0, 1000)
-        
         if item_type == "segment":
             old_name = item.text(0).replace("Segment: ", "").strip()
-            # This is a placeholder for the real old name, which we need to deduce
-            # For simplicity, we find it by looking at the first child's data
-            if item.childCount() > 0 and item.child(0).childCount() > 0:
-                 old_name = item.child(0).child(0).data(0, 1000).segment
+            if item.childCount() > 0 and item.child(0).childCount() > 0: old_name = item.child(0).child(0).data(0, 1000).segment
             self.handle_segment_rename(item, old_name)
-        elif item_type == "layer":
-            self.handle_layer_rename(item)
-        elif isinstance(item_type, AnimationClip):
-            self.update_clip_name(item_type, item, item.text(0).replace("Clip: ", "").strip())
+        elif item_type == "layer": self.handle_layer_rename(item)
+        elif isinstance(item_type, AnimationClip): self.update_clip_name(item_type, item, item.text(0).replace("    Clip: ", "").strip())
 
     def handle_segment_rename(self, item, old_name):
-        new_name = item.text(0).replace("Segment: ", "").strip()
-        
-        self.tree.blockSignals(True)
-        if not new_name or new_name == old_name:
-            item.setText(0, f"Segment: {old_name}")
-            self.tree.blockSignals(False)
-            return
-
+        new_name = item.text(0).replace("Segment: ", "").strip(); self.tree.blockSignals(True)
+        if not new_name or new_name == old_name: item.setText(0, f"Segment: {old_name}"); self.tree.blockSignals(False); return
         if any(c.segment == new_name for c in self.animation_file.clips):
-            QMessageBox.warning(self, "Name Conflict", f"A segment named '{new_name}' already exists.")
-            item.setText(0, f"Segment: {old_name}")
-            self.tree.blockSignals(False)
-            return
-            
+            QMessageBox.warning(self, "Conflict", f"Segment '{new_name}' exists."); item.setText(0, f"Segment: {old_name}"); self.tree.blockSignals(False); return
         for clip in self.animation_file.clips:
-            if clip.segment == old_name:
-                clip.segment = new_name
-                
-        self.log_message(f"Renamed segment '{old_name}' to '{new_name}'. All child clips updated.")
-        item.setText(0, f"Segment: {new_name}")
-        self.tree.blockSignals(False)
-        self.populate_animation_tree()
+            if clip.segment == old_name: clip.segment = new_name
+        self.log_message(f"Renamed segment '{old_name}' to '{new_name}'."); item.setText(0, f"Segment: {new_name}"); self.tree.blockSignals(False); self.populate_animation_tree()
 
     def handle_layer_rename(self, item):
-        new_name = item.text(0).replace("Layer: ", "").replace("  ", "").strip()
-        segment_name = item.parent().text(0).replace("Segment: ", "").strip()
-        
-        old_name = new_name # Placeholder
-        if item.childCount() > 0:
-            old_name = item.child(0).data(0, 1000).layer
-            
+        new_name, seg_name = item.text(0).replace("Layer: ", "").replace("  ", "").strip(), item.parent().text(0).replace("Segment: ", "").strip()
+        old_name = new_name;
+        if item.childCount() > 0: old_name = item.child(0).data(0, 1000).layer
         self.tree.blockSignals(True)
-        if not new_name or new_name == old_name:
-            item.setText(0, f"  Layer: {old_name}")
-            self.tree.blockSignals(False)
-            return
-            
-        if any(c.layer == new_name and c.segment == segment_name for c in self.animation_file.clips):
-            QMessageBox.warning(self, "Name Conflict", f"A layer named '{new_name}' already exists in this segment.")
-            item.setText(0, f"  Layer: {old_name}")
-            self.tree.blockSignals(False)
-            return
-        
+        if not new_name or new_name == old_name: item.setText(0, f"  Layer: {old_name}"); self.tree.blockSignals(False); return
+        if any(c.layer == new_name and c.segment == seg_name for c in self.animation_file.clips):
+            QMessageBox.warning(self, "Conflict", f"Layer '{new_name}' exists in this segment."); item.setText(0, f"  Layer: {old_name}"); self.tree.blockSignals(False); return
         for clip in self.animation_file.clips:
-            if clip.segment == segment_name and clip.layer == old_name:
-                clip.layer = new_name
-        
-        self.log_message(f"Renamed layer '{old_name}' to '{new_name}' in segment '{segment_name}'.")
-        item.setText(0, f"  Layer: {new_name}")
-        self.tree.blockSignals(False)
-        self.populate_animation_tree()
+            if clip.segment == seg_name and clip.layer == old_name: clip.layer = new_name
+        self.log_message(f"Renamed layer '{old_name}' to '{new_name}' in '{seg_name}'."); item.setText(0, f"  Layer: {new_name}"); self.tree.blockSignals(False); self.populate_animation_tree()
 
-    def update_clip_name(self, clip, tree_item, new_name_raw):
-        old_name = clip.name
-        new_name = new_name_raw.strip()
-        
-        editor = self.properties_panel.name_edit
-        was_blocked = editor.signalsBlocked()
-        editor.blockSignals(True)
-        
-        if not new_name or new_name == old_name:
-            editor.setText(old_name)
-            editor.blockSignals(was_blocked)
-            return
-            
-        for other_clip in self.animation_file.clips:
-            if (other_clip is not clip and
-                other_clip.segment == clip.segment and
-                other_clip.layer == clip.layer and
-                other_clip.name == new_name):
-                QMessageBox.warning(self, "Name Conflict", f"A clip named '{new_name}' already exists in this layer.")
-                editor.setText(old_name)
-                tree_item.setText(0, f"    Clip: {old_name}")
-                editor.blockSignals(was_blocked)
-                return
-
-        clip.name = new_name
-        self.log_message(f"Renamed clip '{old_name}' to '{new_name}'.")
-
-        for other_clip in self.animation_file.clips:
-            if other_clip.other_properties.get("NextAnimationName") == old_name:
-                if other_clip.layer == clip.layer and other_clip.segment == clip.segment:
-                    other_clip.other_properties["NextAnimationName"] = new_name
-                    self.log_message(f"Updated NextAnimationName for clip '{other_clip.name}' to '{new_name}'.")
-
-        editor.setText(new_name)
-        tree_item.setText(0, f"    Clip: {new_name}")
-        editor.blockSignals(was_blocked)
+    def update_clip_name(self, clip, item, new_name_raw):
+        old, new = clip.name, new_name_raw.strip(); editor = self.properties_panel.name_edit; was_blocked = editor.signalsBlocked(); editor.blockSignals(True)
+        if not new or new == old: editor.setText(old); item.setText(0, f"    Clip: {old}"); editor.blockSignals(was_blocked); return
+        if any(c is not clip and c.segment==clip.segment and c.layer==clip.layer and c.name==new for c in self.animation_file.clips):
+            QMessageBox.warning(self, "Conflict", f"Clip '{new}' exists in this layer."); editor.setText(old); item.setText(0, f"    Clip: {old}"); editor.blockSignals(was_blocked); return
+        clip.name = new; self.log_message(f"Renamed clip '{old}' to '{new}'.")
+        for other in self.animation_file.clips:
+            if other.other_properties.get("NextAnimationName")==old and other.layer==clip.layer and other.segment==clip.segment:
+                other.other_properties["NextAnimationName"] = new; self.log_message(f"Updated NextAnimationName for '{other.name}'.")
+        editor.setText(new); item.setText(0, f"    Clip: {new}"); editor.blockSignals(was_blocked)
 
     def duplicate_selected_clip(self):
-        item = self.tree.currentItem()
-        if not item: return
+        item = self.tree.currentItem();
+        if not item or not isinstance(item.data(0, 1000), AnimationClip): return
         clip_obj = item.data(0, 1000)
-        if not isinstance(clip_obj, AnimationClip): return
-
-        base_name = clip_obj.name
-        new_name = f"{base_name} (copy)"
-        layer_clips = [c for c in self.animation_file.clips if c.segment == clip_obj.segment and c.layer == clip_obj.layer]
-        existing_names = {c.name for c in layer_clips}
-        
-        counter = 2
-        while new_name in existing_names:
-            new_name = f"{base_name} (copy {counter})"
-            counter += 1
-
-        new_clip = copy.deepcopy(clip_obj)
-        new_clip.name = new_name
+        base, new = clip_obj.name, f"{clip_obj.name} (copy)"; counter = 2
+        existing = {c.name for c in self.animation_file.clips if c.segment==clip_obj.segment and c.layer==clip_obj.layer}
+        while new in existing: new = f"{base} (copy {counter})"; counter += 1
+        new_clip = copy.deepcopy(clip_obj); new_clip.name = new
         new_clip.order_index = max((c.order_index for c in self.animation_file.clips), default=-1) + 1
-        
         self.animation_file.clips.append(new_clip)
-        self.log_message(f"Duplicated clip '{clip_obj.name}' as '{new_name}' in '{new_clip.segment}/{new_clip.layer}'.")
-        self.populate_animation_tree()
+        self.log_message(f"Duplicated '{clip_obj.name}' as '{new}'."); self.populate_animation_tree()
 
     def batch_rename_items(self):
-        selected_items = [item.data(0, 1000) for item in self.tree.selectedItems() if isinstance(item.data(0, 1000), AnimationClip)]
-        if not selected_items:
-            QMessageBox.information(self, "Info", "Select one or more clips to rename.")
-            return
-
+        selected = [item.data(0, 1000) for item in self.tree.selectedItems() if isinstance(item.data(0, 1000), AnimationClip)]
+        if not selected: QMessageBox.information(self, "Info", "Select clips to rename."); return
         dialog = BatchRenameDialog(self)
         if dialog.exec():
-            find_text = dialog.find_edit.text()
-            replace_text = dialog.replace_edit.text()
-            prefix = dialog.prefix_edit.text()
-            suffix = dialog.suffix_edit.text()
-            
-            renamed_count = 0
-            for clip in selected_items:
-                original_name = clip.name
-                new_name = original_name
+            find, replace, prefix, suffix = dialog.find_edit.text(), dialog.replace_edit.text(), dialog.prefix_edit.text(), dialog.suffix_edit.text()
+            renamed = 0
+            for clip in selected:
+                original, new = clip.name, clip.name
+                if find: new = new.replace(find, replace)
+                if prefix: new = prefix + new
+                if suffix: new = new + suffix
+                if new != original:
+                    is_conflict = any(c.name==new and c.layer==clip.layer and c.segment==clip.segment for c in self.animation_file.clips if c is not clip)
+                    if is_conflict: self.log_message(f"SKIPPED rename for '{original}' due to conflict."); continue
+                    clip.name = new
+                    for other in self.animation_file.clips:
+                        if other.other_properties.get("NextAnimationName")==original and other.layer==clip.layer and other.segment==clip.segment:
+                            other.other_properties["NextAnimationName"] = new
+                    renamed += 1
+            self.log_message(f"Batch renamed {renamed} clip(s)."); self.populate_animation_tree()
+
+    def center_root_on_first_frame(self):
+        selected_items = self.tree.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select one or more clips to process."); return
+
+        clips_to_process = [item.data(0, 1000) for item in selected_items if isinstance(item.data(0, 1000), AnimationClip)]
+        if not clips_to_process:
+            QMessageBox.warning(self, "Invalid Selection", "Please select valid animation clips."); return
+
+        self.log_message(f"Starting 'Center Root' operation for {len(clips_to_process)} clip(s)...")
+        processed_count = 0
+        for clip in clips_to_process:
+            try:
+                # 1. Identify root controller (flexible) and feet
+                root_options = ['control', 'hipControl', 'pelvisControl']
+                root_controller = next((c for name in root_options for c in clip.controllers if c.id == name), None)
+                lfoot_controller = next((c for c in clip.controllers if c.id == 'lFootControl'), None)
+                rfoot_controller = next((c for c in clip.controllers if c.id == 'rFootControl'), None)
+
+                if not all([root_controller, lfoot_controller, rfoot_controller]):
+                    self.log_message(f"WARNING: Skipping clip '{clip.name}'. Missing required controllers (a root, and both feet).")
+                    continue
+
+                # 2. Decode first keyframe to get initial local positions
+                def get_pos_at_time(controller, axis, time_target):
+                    last_v, last_c = 0.0, 3 # Start with safe defaults
+                    for kf_str in controller.properties.get(axis, []):
+                        t, v, c = KeyframeDecoder.decode_keyframe(kf_str, last_v, last_c)
+                        if math.isclose(t, time_target, abs_tol=1e-5): return v
+                        last_v, last_c = v, c
+                    self.log_message(f"WARNING: No keyframe at t={time_target} for {controller.id}/{axis}. Using 0.0.")
+                    return 0.0 
+
+                p_root_local = [get_pos_at_time(root_controller, axis, 0.0) for axis in ['X', 'Y', 'Z']]
+                p_lfoot_local = [get_pos_at_time(lfoot_controller, axis, 0.0) for axis in ['X', 'Y', 'Z']]
+                p_rfoot_local = [get_pos_at_time(rfoot_controller, axis, 0.0) for axis in ['X', 'Y', 'Z']]
                 
-                if find_text:
-                    new_name = new_name.replace(find_text, replace_text)
-                if prefix:
-                    new_name = prefix + new_name
-                if suffix:
-                    new_name = new_name + suffix
+                # 3. Calculate the delta to apply to ALL controllers' keyframes
+                delta_x = -p_root_local[0]
+                delta_z = -p_root_local[2]
+                delta_y = 0 # Y-axis modification is disabled as per user request
+
+                delta = (delta_x, delta_y, delta_z)
+                
+                self.log_message(f"Clip '{clip.name}': Applying delta XZ ({delta_x:.4f}, {delta_z:.4f}) to all controllers.")
+                
+                # 4. Apply the calculated delta to all position keyframes of all controllers
+                for controller in clip.controllers:
+                    if controller.id.endswith("Rotation"): continue # Skip pure rotation controllers if any
                     
-                if new_name != original_name:
-                    is_conflict = any(c.name == new_name and c.layer == clip.layer and c.segment == clip.segment
-                                    for c in self.animation_file.clips if c is not clip)
-                    if is_conflict:
-                        self.log_message(f"SKIPPED batch rename for '{original_name}' to '{new_name}' due to name conflict.")
-                        continue
-                    
-                    clip.name = new_name
-                    for other_clip in self.animation_file.clips:
-                        if other_clip.other_properties.get("NextAnimationName") == original_name and \
-                           other_clip.layer == clip.layer and other_clip.segment == clip.segment:
-                           other_clip.other_properties["NextAnimationName"] = new_name
-                           
-                    renamed_count += 1
-            
-            self.log_message(f"Batch renamed {renamed_count} clip(s).")
-            self.populate_animation_tree()
+                    # Apply delta to X and Z axis, leave Y untouched
+                    for axis_idx, axis in enumerate(['X', 'Z']):
+                        if axis not in controller.properties: continue
+                        
+                        current_delta = delta[axis_idx]
+                        new_keyframes, last_v, last_c = [], 0.0, 3
+                        
+                        sorted_kfs = sorted(
+                            [KeyframeDecoder.decode_keyframe(kf, 0.0, 3) for kf in controller.properties[axis]],
+                            key=lambda k: k[0]
+                        )
+
+                        for t, v, c in sorted_kfs:
+                            new_v = v + current_delta
+                            new_kf_str = KeyframeEncoder.encode_keyframe(t, new_v, c, last_v, last_c)
+                            new_keyframes.append(new_kf_str)
+                            last_v, last_c = new_v, c
+                        controller.properties[axis] = new_keyframes
+                processed_count += 1
+            except Exception as e:
+                self.log_message(f"ERROR: Failed to process clip '{clip.name}'. Reason: {e}")
+                import traceback
+                traceback.print_exc()
+
+        self.log_message(f"Root centering operation finished. Processed {processed_count} clip(s).")
+        if self.current_file_path: self.setWindowTitle(self.windowTitle() + " *")
+        self.on_tree_selection_changed(); self.populate_animation_tree()
+
 
 class MergeConflictDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Merge Clip Name Conflicts")
         layout = QVBoxLayout(self)
-
         layout.addWidget(QLabel("How should clips with conflicting names be handled?"))
-
         self.rename_radio = QRadioButton("Rename and Add (e.g., 'Clip_merged')")
         self.rename_radio.setChecked(True)
         self.replace_radio = QRadioButton("Replace Existing Clips")
         self.skip_radio = QRadioButton("Skip Conflicting Clips")
-
-        layout.addWidget(self.rename_radio)
-        layout.addWidget(self.replace_radio)
-        layout.addWidget(self.skip_radio)
-
+        layout.addWidget(self.rename_radio); layout.addWidget(self.replace_radio); layout.addWidget(self.skip_radio)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
 
     def get_selected_strategy(self):
-        if self.replace_radio.isChecked():
-            return "replace"
-        if self.skip_radio.isChecked():
-            return "skip"
-        return "rename" # Default
+        if self.replace_radio.isChecked(): return "replace"
+        if self.skip_radio.isChecked(): return "skip"
+        return "rename"
 
 class BatchRenameDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Batch Rename Clips")
         layout = QFormLayout(self)
-        
-        self.find_edit = QLineEdit()
-        self.replace_edit = QLineEdit()
-        self.prefix_edit = QLineEdit()
-        self.suffix_edit = QLineEdit()
-        
-        layout.addRow("Find text:", self.find_edit)
-        layout.addRow("Replace with:", self.replace_edit)
+        self.find_edit, self.replace_edit, self.prefix_edit, self.suffix_edit = QLineEdit(), QLineEdit(), QLineEdit(), QLineEdit()
+        layout.addRow("Find text:", self.find_edit); layout.addRow("Replace with:", self.replace_edit)
         layout.addRow(QLabel("--- OR ---"))
-        layout.addRow("Add Prefix:", self.prefix_edit)
-        layout.addRow("Add Suffix:", self.suffix_edit)
-        
+        layout.addRow("Add Prefix:", self.prefix_edit); layout.addRow("Add Suffix:", self.suffix_edit)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); layout.addRow(buttons)
 
 # --- 5. Application Entry Point ---
 if __name__ == '__main__':
