@@ -1,3 +1,3 @@
 del build
 del dist
-pyinstaller --onefile --windowed --icon=timeliner-logo.ico --add-data "timeliner-logo.ico;." main.py
+pyinstaller --noupx --onefile --windowed --icon=timeliner-logo.ico --version-file=version.txt --add-data "timeliner-logo.ico;." main.py
