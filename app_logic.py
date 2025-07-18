@@ -581,16 +581,18 @@ class AppLogic(QObject):
         self.log_requested.emit(f"Manual offset operation finished. Processed {processed_count} clip(s).")
         self.mark_as_dirty()
 
-    def create_new_segment(self, name):
+    def create_new_segment(self, name, target_atom_id):
         if not self.animation_file: return
-        if any(c.segment == name for c in self.animation_file.clips):
-            self.error_occurred.emit("Name Conflict", f"Segment '{name}' already exists.")
+        
+        # Check for name conflict within the target atom
+        if any(c.segment == name and c.atom_id == target_atom_id for c in self.animation_file.clips):
+            self.error_occurred.emit("Name Conflict", f"Segment '{name}' already exists for atom '{target_atom_id}'.")
             return
+            
         max_order = max((c.order_index for c in self.animation_file.clips), default=-1)
-        atom_id = self.animation_file.clips[0].atom_id if self.animation_file.clips else "(Standalone)"
-        new_clip = AnimationClip(name="New Animation", segment=name, layer="Main", length=1.0, order_index=max_order + 1, atom_id=atom_id)
+        new_clip = AnimationClip(name="New Animation", segment=name, layer="Main", length=1.0, order_index=max_order + 1, atom_id=target_atom_id)
         self.animation_file.clips.append(new_clip)
-        self.log_requested.emit(f"Created segment '{name}'.")
+        self.log_requested.emit(f"Created segment '{name}' for atom '{target_atom_id}'.")
         self.mark_as_dirty()
 
     def duplicate_clip(self, clip_obj):
@@ -607,6 +609,35 @@ class AppLogic(QObject):
         self.animation_file.clips.append(new_clip)
         
         self.log_requested.emit(f"Duplicated '{clip_obj.name}' as '{new_name}'.")
+        self.mark_as_dirty()
+
+    def duplicate_segment(self, segment_data):
+        atom_id, old_seg_name = segment_data[1], segment_data[2]
+
+        # Find unique name for the new segment
+        base_name = old_seg_name
+        new_seg_name = f"{base_name} (copy)"
+        counter = 2
+        existing_segment_names = {c.segment for c in self.animation_file.clips if c.atom_id == atom_id}
+        while new_seg_name in existing_segment_names:
+            new_seg_name = f"{base_name} (copy {counter})"
+            counter += 1
+
+        clips_to_duplicate = [c for c in self.animation_file.clips if c.atom_id == atom_id and c.segment == old_seg_name]
+        if not clips_to_duplicate:
+            self.log_requested.emit(f"Segment '{old_seg_name}' is empty, nothing to duplicate.")
+            return
+
+        max_order = max((c.order_index for c in self.animation_file.clips), default=-1)
+        
+        for clip in clips_to_duplicate:
+            new_clip = copy.deepcopy(clip)
+            new_clip.segment = new_seg_name
+            max_order += 1
+            new_clip.order_index = max_order
+            self.animation_file.clips.append(new_clip)
+
+        self.log_requested.emit(f"Duplicated segment '{old_seg_name}' as '{new_seg_name}' with {len(clips_to_duplicate)} clip(s).")
         self.mark_as_dirty()
 
     def batch_rename_clips(self, clips_to_rename, find, replace, prefix, suffix):

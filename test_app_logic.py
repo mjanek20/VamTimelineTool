@@ -346,6 +346,82 @@ class TestAppLogic:
         assert len(clip_other_seg.controllers) == 2
         assert clip_other_seg.layer == "Base"
 
+    def test_create_new_segment_targets_correct_atom_in_scene(self, app_logic_instance):
+        """Sprawdza, czy nowy segment jest tworzony dla właściwego atomu w pliku sceny."""
+        # 1. Przygotowanie danych (ręczne)
+        app_logic_instance.animation_file = AnimationFile()
+        app_logic_instance.animation_file.is_scene = True
+        app_logic_instance.animation_file.clips = [
+            AnimationClip("Clip1A", "Seg1", "L1", 1.0, atom_id="PersonA"),
+            AnimationClip("Clip1B", "Seg1", "L1", 1.0, atom_id="PersonB")
+        ]
+        initial_clip_count = len(app_logic_instance.animation_file.clips)
+
+        # 2. Utworzenie nowego segmentu dla PersonB
+        app_logic_instance.create_new_segment(name="NewSegmentForB", target_atom_id="PersonB")
+
+        # 3. Weryfikacja
+        assert len(app_logic_instance.animation_file.clips) == initial_clip_count + 1
+        new_clip = next(c for c in app_logic_instance.animation_file.clips if c.segment == "NewSegmentForB")
+        assert new_clip.atom_id == "PersonB"
+        assert not any(c.segment == "NewSegmentForB" and c.atom_id == "PersonA" for c in app_logic_instance.animation_file.clips)
+
+    def test_duplicate_segment_copies_all_clips_to_new_segment(self, app_logic_instance):
+        """Sprawdza, czy duplikowanie segmentu poprawnie kopiuje wszystkie jego klipy."""
+        clip1 = AnimationClip("Walk", "Locomotion", "Base", 2.0, atom_id="Person")
+        clip2 = AnimationClip("Run", "Locomotion", "Base", 1.5, atom_id="Person")
+        clip3 = AnimationClip("Wave", "Gestures", "Main", 1.0, atom_id="Person")
+        app_logic_instance.animation_file = AnimationFile()
+        app_logic_instance.animation_file.clips = [clip1, clip2, clip3]
+
+        segment_to_duplicate_data = ('segment', 'Person', 'Locomotion')
+        app_logic_instance.duplicate_segment(segment_to_duplicate_data)
+
+        assert len(app_logic_instance.animation_file.clips) == 5
+
+        original_loco_clips = [c for c in app_logic_instance.animation_file.clips if c.segment == 'Locomotion']
+        assert len(original_loco_clips) == 2
+
+        new_segment_name = "Locomotion (copy)"
+        copied_clips = [c for c in app_logic_instance.animation_file.clips if c.segment == new_segment_name]
+        assert len(copied_clips) == 2
+        
+        copied_clip_names = {c.name for c in copied_clips}
+        assert copied_clip_names == {"Walk", "Run"}
+        for c in copied_clips:
+            assert c.atom_id == "Person"
+
+    def test_duplicate_segment_handles_naming_conflicts(self, app_logic_instance):
+        """Sprawdza, czy duplikowanie segmentu poprawnie obsługuje konflikty nazw."""
+        clip = AnimationClip("Walk", "Locomotion", "Base", 2.0, atom_id="Person")
+        app_logic_instance.animation_file = AnimationFile()
+        app_logic_instance.animation_file.clips = [clip]
+        segment_data = ('segment', 'Person', 'Locomotion')
+
+        # Duplikuj pierwszy raz
+        app_logic_instance.duplicate_segment(segment_data)
+        # Duplikuj drugi raz (ten sam oryginał)
+        app_logic_instance.duplicate_segment(segment_data)
+
+        segment_names = {c.segment for c in app_logic_instance.animation_file.clips}
+        assert "Locomotion" in segment_names
+        assert "Locomotion (copy)" in segment_names
+        assert "Locomotion (copy 2)" in segment_names
+        assert len(app_logic_instance.animation_file.clips) == 3
+
+    def test_duplicate_empty_segment_does_nothing(self, app_logic_instance):
+        """Sprawdza, czy próba duplikacji pustego segmentu nic nie robi."""
+        clip = AnimationClip("Walk", "Locomotion", "Base", 2.0, atom_id="Person")
+        app_logic_instance.animation_file = AnimationFile()
+        app_logic_instance.animation_file.clips = [clip]
+
+        # Próba duplikacji segmentu, który nie ma żadnych klipów (lub nie istnieje)
+        segment_data = ('segment', 'Person', 'EmptySegment')
+        app_logic_instance.duplicate_segment(segment_data)
+
+        # Liczba klipów nie powinna się zmienić
+        assert len(app_logic_instance.animation_file.clips) == 1
+
 class TestDropPrediction:
     @pytest.fixture
     def app_logic_with_clips(self, app_logic_instance):

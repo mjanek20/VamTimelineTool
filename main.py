@@ -52,14 +52,15 @@ class MainWindow(QMainWindow):
         rename_action=QAction("Re&name...",self);rename_action.setShortcut("F2");rename_action.triggered.connect(self.rename_selected_item)
         batch_rename_action=QAction("Change Names in &Batch...",self);batch_rename_action.triggered.connect(self.batch_rename_items)
         self.delete_action=QAction("&Delete Selected",self);self.delete_action.setShortcut("Delete");self.delete_action.triggered.connect(self.delete_selected_items)
-        duplicate_action=QAction("&Duplicate Clip",self);duplicate_action.setShortcut("Ctrl+D");duplicate_action.triggered.connect(self.duplicate_selected_clip)
+        duplicate_clip_action=QAction("&Duplicate Clip",self);duplicate_clip_action.setShortcut("Ctrl+D");duplicate_clip_action.triggered.connect(self.duplicate_selected_clip)
+        self.duplicate_segment_action=QAction("Duplicate Se&gment", self);self.duplicate_segment_action.triggered.connect(self.duplicate_selected_segment)
         center_root_action=QAction("Center &Root on First Frame",self);center_root_action.triggered.connect(self.center_root_on_first_frame)
         move_by_offset_action = QAction("Move by &Offset...", self); move_by_offset_action.triggered.connect(self.move_root_by_offset)
         self.dark_mode_action = QAction("&Dark Mode", self); self.dark_mode_action.setCheckable(True); self.dark_mode_action.toggled.connect(self.toggle_dark_mode)
 
         menu_bar=self.menuBar()
         file_menu=menu_bar.addMenu("&File");file_menu.addAction(self.open_action);file_menu.addAction(self.save_as_action);file_menu.addSeparator();file_menu.addAction(self.new_segment_action);file_menu.addSeparator();file_menu.addAction(exit_action)
-        edit_menu=menu_bar.addMenu("&Edit");edit_menu.addAction(rename_action);edit_menu.addAction(batch_rename_action);edit_menu.addAction(duplicate_action);edit_menu.addSeparator();edit_menu.addAction(center_root_action);edit_menu.addAction(move_by_offset_action);edit_menu.addSeparator();edit_menu.addAction(self.delete_action)
+        edit_menu=menu_bar.addMenu("&Edit");edit_menu.addAction(rename_action);edit_menu.addAction(batch_rename_action);edit_menu.addAction(duplicate_clip_action);edit_menu.addAction(self.duplicate_segment_action);edit_menu.addSeparator();edit_menu.addAction(center_root_action);edit_menu.addAction(move_by_offset_action);edit_menu.addSeparator();edit_menu.addAction(self.delete_action)
         view_menu=menu_bar.addMenu("&View"); view_menu.addAction(self.dark_mode_action)
         
         toolbar=self.addToolBar("Main Toolbar");toolbar.addAction(self.open_action);toolbar.addAction(self.save_as_action);toolbar.addSeparator();toolbar.addAction(self.new_segment_action);toolbar.addAction(self.delete_action)
@@ -322,9 +323,29 @@ class MainWindow(QMainWindow):
         if not self.app_logic.animation_file:
             self.log_message("Action failed: No data loaded.")
             return
-        text, ok = QInputDialog.getText(self, 'New Segment', 'Enter new segment name:')
+
+        target_atom_id = None
+        selected_item = self.tree.currentItem()
+
+        if not self.app_logic.animation_file.is_scene:
+            target_atom_id = "(Standalone)"
+        elif selected_item:
+            data = selected_item.data(0, 1000)
+            if isinstance(data, AnimationClip):
+                target_atom_id = data.atom_id
+            elif isinstance(data, tuple):
+                # ('atom', atom_id)
+                # ('segment', atom_id, seg_name)
+                # ('layer', atom_id, seg_name, layer_name)
+                target_atom_id = data[1]
+        
+        if not target_atom_id:
+            QMessageBox.warning(self, "Action Required", "Please select an item (atom, segment, layer, or clip) to specify which atom the new segment should belong to.")
+            return
+
+        text, ok = QInputDialog.getText(self, 'New Segment', f"Enter new segment name for atom '{target_atom_id}':")
         if ok and text:
-            self.app_logic.create_new_segment(text)
+            self.app_logic.create_new_segment(text, target_atom_id)
 
     def duplicate_selected_clip(self):
         item = self.tree.currentItem()
@@ -332,6 +353,15 @@ class MainWindow(QMainWindow):
             self.log_message("Please select a single clip to duplicate.")
             return
         self.app_logic.duplicate_clip(item.data(0, 1000))
+
+    def duplicate_selected_segment(self):
+        item = self.tree.currentItem()
+        if not item: return
+        data = item.data(0, 1000)
+        if isinstance(data, tuple) and data[0] == 'segment':
+            self.app_logic.duplicate_segment(data)
+        else:
+            self.log_message("Please select a single segment to duplicate.")
 
     def batch_rename_items(self):
         selected_clips = [item.data(0, 1000) for item in self.tree.selectedItems() if isinstance(item.data(0, 1000), AnimationClip)]
@@ -346,12 +376,23 @@ class MainWindow(QMainWindow):
         
     def on_tree_selection_changed(self):
         selected = self.tree.selectedItems()
+        # Handle properties panel
         if selected and isinstance(selected[0].data(0, 1000), AnimationClip):
             self.properties_panel.display_clip_properties(selected[0].data(0, 1000), selected[0])
             self.placeholder_label.hide()
         else:
             self.properties_panel.clear()
             self.placeholder_label.show()
+        
+        # Handle enabling/disabling of actions
+        is_segment_selected = False
+        if len(selected) == 1:
+            data = selected[0].data(0, 1000)
+            if isinstance(data, tuple) and data[0] == 'segment':
+                is_segment_selected = True
+        
+        self.duplicate_segment_action.setEnabled(is_segment_selected)
+
 
     def filter_tree(self, text):
         search_text = text.lower()

@@ -280,10 +280,20 @@ class AnimationTreeWidget(QTreeWidget):
             if len(selected) == 1:
                 item = selected[0]
                 data = item.data(0, 1000)
-                if isinstance(data, tuple) and data[0] in ['segment', 'layer']:
+                
+                if isinstance(data, tuple) and data[0] == 'segment':
                     rename_action = menu.addAction("Rename...")
                     rename_action.setShortcut("F2")
                     rename_action.triggered.connect(self.parent_window.rename_selected_item)
+                    
+                    duplicate_action = menu.addAction("Duplicate Segment")
+                    duplicate_action.triggered.connect(self.parent_window.duplicate_selected_segment)
+
+                elif isinstance(data, tuple) and data[0] == 'layer':
+                    rename_action = menu.addAction("Rename...")
+                    rename_action.setShortcut("F2")
+                    rename_action.triggered.connect(self.parent_window.rename_selected_item)
+
                 elif isinstance(data, AnimationClip):
                     rename_action = menu.addAction("Rename...")
                     rename_action.setShortcut("F2")
