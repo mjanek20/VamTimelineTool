@@ -18,3 +18,6 @@ __pycache__/app_logic.cpython-312.pyc
 __pycache__/conftest.cpython-312-pytest-8.4.1.pyc
 __pycache__/main.cpython-312.pyc
 __pycache__/test_app_logic.cpython-312-pytest-8.4.1.pyc
+__pycache__/app_logic.cpython-312.pyc
+__pycache__/test_app_logic.cpython-312-pytest-8.4.1.pyc
+__pycache__/ui_components.cpython-312.pyc

@@ -5,12 +5,42 @@ from PyQt6.QtCore import Qt, QMimeData
 from PyQt6.QtGui import QIcon, QDrag
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QTreeWidget, QAbstractItemView, QLabel, QMenu,
-    QMessageBox, QLineEdit, QListWidget, QFormLayout, QDialog, QDialogButtonBox,
+    QMessageBox, QLineEdit, QListWidget, QListWidgetItem, QFormLayout, QDialog, QDialogButtonBox,
     QRadioButton
 )
 
 from data_models import AnimationClip, FloatParameter, ControllerTarget, TriggerGroup
 from keyframe_logic import KeyframeEncoder
+
+class DeleteTargetScopeDialog(QDialog):
+    """A dialog to ask the user the scope of the target deletion."""
+    def __init__(self, layer_name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Define Deletion Scope")
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            "Deleting targets will change this clip's structure, making it "
+            "incompatible with its current layer.\n\nHow do you want to proceed?"
+        )
+        layout.addWidget(info_label)
+
+        self.move_radio = QRadioButton("Delete from this clip only and move it to a new/compatible layer.")
+        self.move_radio.setChecked(True)
+        layout.addWidget(self.move_radio)
+
+        self.layer_radio = QRadioButton(f"Delete from ALL clips in the '{layer_name}' layer.")
+        layout.addWidget(self.layer_radio)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_selected_scope(self):
+        if self.layer_radio.isChecked():
+            return "layer"
+        return "move"
 
 class AnimationTreeWidget(QTreeWidget):
     def __init__(self, parent_window):
@@ -168,6 +198,31 @@ class AnimationTreeWidget(QTreeWidget):
         if not menu.isEmpty():
             menu.exec(self.viewport().mapToGlobal(position))
 
+class TargetListWidget(QListWidget):
+    """A QListWidget customized for handling target deletion."""
+    def __init__(self, parent_panel):
+        super().__init__()
+        self.parent_panel = parent_panel
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.open_context_menu)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Delete:
+            self.parent_panel.handle_delete_targets()
+        else:
+            super().keyPressEvent(event)
+
+    def open_context_menu(self, position):
+        selected_items = self.selectedItems()
+        if not selected_items:
+            return
+
+        menu = QMenu(self)
+        delete_action = menu.addAction(f"Delete {len(selected_items)} Target(s)")
+        delete_action.triggered.connect(self.parent_panel.handle_delete_targets)
+        menu.exec(self.viewport().mapToGlobal(position))
+
 class ClipPropertiesPanel(QWidget):
     def __init__(self, main_window):
         super().__init__()
@@ -213,7 +268,7 @@ class ClipPropertiesPanel(QWidget):
         self.layout.addLayout(self.sequence_form_layout)
         
         self.layout.addWidget(QLabel("<b>Targets</b>"))
-        self.targets_list = QListWidget()
+        self.targets_list = TargetListWidget(self)
         self.layout.addWidget(self.targets_list)
         self.layout.addStretch()
 
@@ -237,15 +292,24 @@ class ClipPropertiesPanel(QWidget):
         self.atom_label_widget.setVisible(is_scene)
         self.atom_field_widget.setVisible(is_scene)
         
-        targets = (
-            [f"[C] {c.id}" for c in clip.controllers] + 
-            [f"[F] {p.storable}/{p.name}" for p in clip.float_params] +
-            [f"[T] {tg.name}" for tg in clip.trigger_groups]
-        )
-        if targets:
-            self.targets_list.addItems(sorted(targets))
+        all_targets = []
+        for c in sorted(clip.controllers, key=lambda x: x.id):
+            all_targets.append(("[C]", c.id, c))
+        for p in sorted(clip.float_params, key=lambda x: (x.storable, x.name)):
+            all_targets.append(("[F]", f"{p.storable}/{p.name}", p))
+        for tg in sorted(clip.trigger_groups, key=lambda x: x.name):
+            all_targets.append(("[T]", tg.name, tg))
+
+        if all_targets:
+            for prefix, name, obj_ref in all_targets:
+                list_item = QListWidgetItem(f"{prefix} {name}")
+                list_item.setData(Qt.ItemDataRole.UserRole, obj_ref)
+                self.targets_list.addItem(list_item)
         else:
-            self.targets_list.addItem("No targets in this clip.")
+            list_item = QListWidgetItem("No targets in this clip.")
+            list_item.setFlags(list_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.targets_list.addItem(list_item)
+            
         self.show()
 
     def on_name_changed(self):
@@ -258,6 +322,36 @@ class ClipPropertiesPanel(QWidget):
         self.name_edit.clear()
         self.name_edit.blockSignals(False)
         self.hide()
+
+    def handle_delete_targets(self):
+        if not self.clip: return
+
+        selected_items = self.targets_list.selectedItems()
+        if not selected_items: return
+            
+        targets_to_delete = [item.data(Qt.ItemDataRole.UserRole) for item in selected_items]
+        targets_to_delete = [t for t in targets_to_delete if t is not None]
+        if not targets_to_delete: return
+
+        reply = QMessageBox.question(self, 
+            'Confirm Target Deletion', 
+            f"Are you sure you want to delete {len(targets_to_delete)} selected target(s) from the clip '{self.clip.name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Second, ask for the scope
+        scope_dialog = DeleteTargetScopeDialog(self.clip.layer, self)
+        if not scope_dialog.exec():
+            self.main_window.app_logic.log_requested.emit("Target deletion cancelled by user.")
+            return
+
+        scope = scope_dialog.get_selected_scope()
+        self.main_window.app_logic.process_target_deletion(self.clip, targets_to_delete, scope)
+
 
 class OffsetDialog(QDialog):
     def __init__(self, parent=None):

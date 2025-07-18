@@ -278,6 +278,76 @@ class TestAppLogic:
         names = {c.name for c in app_logic_instance.animation_file.clips}
         assert {"Motion_A", "Motion_B"} == names
 
+    def test_internal_delete_targets_from_single_clip(self, app_logic_instance):
+        """Tests the internal helper for deleting targets from a clip."""
+        clip = AnimationClip("TestClip", "S1", "L1", 1.0)
+        fp_to_delete = FloatParameter("s1", "p_delete", [], 0, 1)
+        ct_to_delete = ControllerTarget("c_delete")
+        clip.float_params = [fp_to_delete]
+        clip.controllers = [ct_to_delete]
+        
+        deleted_count = app_logic_instance._delete_targets_from_single_clip(clip, [fp_to_delete, ct_to_delete])
+        
+        assert deleted_count == 2
+        assert not clip.float_params
+        assert not clip.controllers
+
+    def test_process_target_deletion_scope_move(self, app_logic_instance):
+        """Tests deleting a target and moving the clip to a new layer."""
+        ct_common = ControllerTarget("hipControl")
+        ct_to_delete = ControllerTarget("chestControl")
+        
+        clip_a = AnimationClip("A", "S1", "Base", 1.0)
+        clip_a.controllers = [copy.deepcopy(ct_common), copy.deepcopy(ct_to_delete)]
+        
+        clip_b = AnimationClip("B", "S1", "Base", 1.0)
+        clip_b.controllers = [copy.deepcopy(ct_common), copy.deepcopy(ct_to_delete)]
+
+        app_logic_instance.animation_file = AnimationFile()
+        app_logic_instance.animation_file.clips = [clip_a, clip_b]
+        
+        app_logic_instance.process_target_deletion(clip_a, [ct_to_delete], "move")
+        
+        assert len(app_logic_instance.animation_file.clips) == 2
+        # Clip A should have changed
+        assert len(clip_a.controllers) == 1
+        assert clip_a.controllers[0].id == "hipControl"
+        assert clip_a.layer == "Base_1" # It was moved to a new layer
+        
+        # Clip B should be unchanged
+        assert len(clip_b.controllers) == 2
+        assert clip_b.layer == "Base"
+
+    def test_process_target_deletion_scope_layer(self, app_logic_instance):
+        """Tests deleting a target from all clips in a layer."""
+        ct_common = ControllerTarget("hipControl")
+        ct_to_delete = ControllerTarget("chestControl")
+        
+        clip_a = AnimationClip("A", "S1", "Base", 1.0, atom_id="Person")
+        clip_a.controllers = [copy.deepcopy(ct_common), copy.deepcopy(ct_to_delete)]
+        
+        clip_b = AnimationClip("B", "S1", "Base", 1.0, atom_id="Person")
+        clip_b.controllers = [copy.deepcopy(ct_common), copy.deepcopy(ct_to_delete)]
+
+        clip_other_seg = AnimationClip("C", "S2", "Base", 1.0, atom_id="Person")
+        clip_other_seg.controllers = [copy.deepcopy(ct_common), copy.deepcopy(ct_to_delete)]
+
+        app_logic_instance.animation_file = AnimationFile()
+        app_logic_instance.animation_file.clips = [clip_a, clip_b, clip_other_seg]
+        
+        app_logic_instance.process_target_deletion(clip_a, [ct_to_delete], "layer")
+        
+        assert len(app_logic_instance.animation_file.clips) == 3
+        # Both clips in the same layer should have changed
+        assert len(clip_a.controllers) == 1
+        assert clip_a.layer == "Base"
+        assert len(clip_b.controllers) == 1
+        assert clip_b.layer == "Base"
+        
+        # The clip in another segment should be untouched
+        assert len(clip_other_seg.controllers) == 2
+        assert clip_other_seg.layer == "Base"
+
 class TestFileMerging:
     @pytest.fixture
     def base_file_data(self):

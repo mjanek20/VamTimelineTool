@@ -291,41 +291,50 @@ class AppLogic(QObject):
         source_clips = [c for c in self.animation_file.clips if id(c) in source_clips_ids]
         if not source_clips: return
 
-        # Source and Target info
         src_sample = source_clips[0]
         src_atom, src_seg, src_layer = src_sample.atom_id, src_sample.segment, src_sample.layer
         tgt_atom, tgt_seg, tgt_layer_name = target_layer_data[1], target_layer_data[2], target_layer_data[3]
 
         final_tgt_layer_name = tgt_layer_name
+        
+        # Signature of the clips being moved.
+        src_signature = self._get_layer_signature(src_atom, src_seg, src_layer, source_clips)
 
-        # --- RESTORED LOGIC START ---
-        # If moving to a different segment or atom, find a compatible layer or create a new one.
-        if src_atom != tgt_atom or src_seg != tgt_seg:
-            src_signature = self._get_layer_signature(src_atom, src_seg, src_layer)
-            
-            # Find a compatible layer in the target segment
-            compatible_layer = None
-            layers_in_tgt_segment = {c.layer for c in self.animation_file.clips if c.atom_id == tgt_atom and c.segment == tgt_seg}
-            
-            for existing_layer in layers_in_tgt_segment:
-                tgt_signature = self._get_layer_signature(tgt_atom, tgt_seg, existing_layer)
-                if src_signature == tgt_signature:
-                    compatible_layer = existing_layer
-                    self.log_requested.emit(f"Found compatible layer '{compatible_layer}' in '{tgt_seg}'.")
-                    break
+        # Signature of the target layer (excluding the clips that are about to be moved out of it, if it's the same layer).
+        other_clips_in_target_layer = [
+            c for c in self.get_layer_clips(tgt_atom, tgt_seg, tgt_layer_name) 
+            if id(c) not in source_clips_ids
+        ]
+        
+        # If the target layer will have other clips after the move, its signature must match the source clips' signature.
+        if other_clips_in_target_layer:
+            tgt_signature = self._get_layer_signature(tgt_atom, tgt_seg, tgt_layer_name, other_clips_in_target_layer)
+            if src_signature != tgt_signature:
+                # Signatures don't match. We must find an alternative home for the source clips.
+                compatible_layer = None
+                layers_in_tgt_segment = {c.layer for c in self.animation_file.clips if c.atom_id == tgt_atom and c.segment == tgt_seg}
+                
+                # Find a compatible layer in the target segment
+                for existing_layer in layers_in_tgt_segment:
+                    if self._get_layer_signature(tgt_atom, tgt_seg, existing_layer) == src_signature:
+                        compatible_layer = existing_layer
+                        self.log_requested.emit(f"Target layer '{tgt_layer_name}' is incompatible. Moving to compatible layer '{compatible_layer}'.")
+                        break
 
-            if compatible_layer:
-                final_tgt_layer_name = compatible_layer
-            else:
-                # No compatible layer, create a new one
-                new_layer_name = src_layer
-                counter = 1
-                while new_layer_name in layers_in_tgt_segment:
-                    new_layer_name = f"{src_layer}_{counter}"
-                    counter += 1
-                final_tgt_layer_name = new_layer_name
-                self.log_requested.emit(f"No compatible layer found. Creating new layer '{final_tgt_layer_name}' in '{tgt_seg}'.")
-        # --- RESTORED LOGIC END ---
+                if compatible_layer:
+                    final_tgt_layer_name = compatible_layer
+                else:
+                    # No compatible layer found, create a new one.
+                    # Base the new name on the source layer's name to be intuitive.
+                    new_layer_name = src_layer if not is_copy else tgt_layer_name
+                    counter = 1
+                    while new_layer_name in layers_in_tgt_segment:
+                        # If moving within the same segment, use the source layer name as a base for the new name
+                        base_name_for_new = src_layer if src_seg == tgt_seg else tgt_layer_name
+                        new_layer_name = f"{base_name_for_new}_{counter}"
+                        counter += 1
+                    final_tgt_layer_name = new_layer_name
+                    self.log_requested.emit(f"No compatible layer found. Creating new layer '{final_tgt_layer_name}' in '{tgt_seg}'.")
 
         clips_in_final_tgt = self.get_layer_clips(tgt_atom, tgt_seg, final_tgt_layer_name)
         max_order = max((c.order_index for c in clips_in_final_tgt), default=-1)
@@ -365,6 +374,66 @@ class AppLogic(QObject):
         deleted_count = initial_count - len(self.animation_file.clips)
         self.log_requested.emit(f"Deleted {deleted_count} clip(s).")
         self.mark_as_dirty()
+
+    def _delete_targets_from_single_clip(self, clip_obj, targets_to_delete):
+        """Internal helper to remove specified targets from a single clip object."""
+        if not clip_obj or not targets_to_delete:
+            return 0
+        
+        deleted_count = 0
+        # Create sets of identifiers for faster lookup
+        fps_to_del = {(t.storable, t.name) for t in targets_to_delete if isinstance(t, FloatParameter)}
+        cts_to_del = {t.id for t in targets_to_delete if isinstance(t, ControllerTarget)}
+        tgs_to_del = {t.name for t in targets_to_delete if isinstance(t, TriggerGroup)}
+
+        initial_fp_count = len(clip_obj.float_params)
+        clip_obj.float_params = [fp for fp in clip_obj.float_params if (fp.storable, fp.name) not in fps_to_del]
+        deleted_count += initial_fp_count - len(clip_obj.float_params)
+        
+        initial_ct_count = len(clip_obj.controllers)
+        clip_obj.controllers = [ct for ct in clip_obj.controllers if ct.id not in cts_to_del]
+        deleted_count += initial_ct_count - len(clip_obj.controllers)
+
+        initial_tg_count = len(clip_obj.trigger_groups)
+        clip_obj.trigger_groups = [tg for tg in clip_obj.trigger_groups if tg.name not in tgs_to_del]
+        deleted_count += initial_tg_count - len(clip_obj.trigger_groups)
+        
+        return deleted_count
+
+    def process_target_deletion(self, source_clip, targets_to_delete, scope):
+        """Handles the complex logic of deleting targets, ensuring layer integrity."""
+        if not source_clip or not targets_to_delete:
+            return
+
+        if scope == 'layer':
+            self.log_requested.emit(f"Starting layer-wide target deletion for layer '{source_clip.layer}'...")
+            clips_in_layer = self.get_layer_clips(source_clip.atom_id, source_clip.segment, source_clip.layer)
+            total_deleted = 0
+            for clip in clips_in_layer:
+                total_deleted += self._delete_targets_from_single_clip(clip, targets_to_delete)
+            
+            self.log_requested.emit(f"Finished: Deleted {total_deleted} target instances from {len(clips_in_layer)} clips.")
+            self.mark_as_dirty()
+
+        elif scope == 'move':
+            self.log_requested.emit(f"Deleting targets from '{source_clip.name}' and moving to a compatible layer...")
+            
+            # Delete targets from the source clip first
+            deleted_count = self._delete_targets_from_single_clip(source_clip, targets_to_delete)
+            if deleted_count == 0:
+                self.log_requested.emit("No matching targets found to delete. Operation cancelled.")
+                return
+            self.log_requested.emit(f"Deleted {deleted_count} target(s) from clip '{source_clip.name}'.")
+
+            # Now, use the move logic to find a new home for the modified clip.
+            # We tell it to "move" to its own layer, which will trigger the compatibility check.
+            target_layer_data = ('layer', source_clip.atom_id, source_clip.segment, source_clip.layer)
+            self.move_or_copy_clips_to_layer([id(source_clip)], target_layer_data, is_copy=False)
+            
+            # mark_as_dirty() is called inside move_or_copy_clips_to_layer
+
+        else:
+            self.log_requested.emit(f"Unknown deletion scope '{scope}'. Operation aborted.")
 
     def save_file(self, file_name):
         if not self.animation_file:
