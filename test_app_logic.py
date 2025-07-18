@@ -396,7 +396,7 @@ class TestDropPrediction:
         
         # Try to move clip A to layer "Simple"
         action, _ = logic.predict_drop_action([clip_a], clip_b, is_copy=False)
-        assert action == DropActionType.MOVE_CLIPS_NEW_LAYER
+        assert action == DropActionType.INVALID
 
     def test_predict_copy_to_incompatible(self, app_logic_with_clips):
         logic = app_logic_with_clips
@@ -404,7 +404,7 @@ class TestDropPrediction:
         clip_b = logic.animation_file.clips[1] # From "Simple" layer
         
         action, _ = logic.predict_drop_action([clip_a], clip_b, is_copy=True)
-        assert action == DropActionType.COPY_CLIPS_NEW_LAYER
+        assert action == DropActionType.INVALID
 
     def test_predict_merge_layers(self, app_logic_with_clips):
         logic = app_logic_with_clips
@@ -430,6 +430,23 @@ class TestDropPrediction:
 
         action, _ = logic.predict_drop_action([clip_a], segment_data, is_copy=False)
         assert action == DropActionType.INVALID
+
+    def test_predict_invalid_drop_between_layers_in_same_segment(self, app_logic_with_clips):
+        logic = app_logic_with_clips
+        clip_a = logic.animation_file.clips[0] # From S1/Base
+        clip_b = logic.animation_file.clips[1] # From S1/Simple
+
+        # Test moving
+        action, msg = logic.predict_drop_action([clip_a], clip_b, is_copy=False)
+        assert action == DropActionType.INVALID
+        assert "within the same segment is disallowed" in msg
+        assert "Moving" in msg
+
+        # Test copying
+        action, msg = logic.predict_drop_action([clip_a], clip_b, is_copy=True)
+        assert action == DropActionType.INVALID
+        assert "within the same segment is disallowed" in msg
+        assert "Copying" in msg
 
 class TestFileMerging:
     @pytest.fixture

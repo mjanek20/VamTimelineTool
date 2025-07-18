@@ -55,6 +55,11 @@ class AppLogic(QObject):
             if not is_copy and (src_atom, src_seg, src_layer) == (tgt_atom, tgt_seg, tgt_layer):
                 return DropActionType.REORDER_CLIPS, "Reorder clips"
 
+            # Block moving/copying between layers in the same segment
+            if (src_atom, src_seg) == (tgt_atom, tgt_seg) and src_layer != tgt_layer:
+                verb = 'Copying' if is_copy else 'Moving'
+                return DropActionType.INVALID, f"{verb} clips to a different layer within the same segment is disallowed."
+
             # Scenario 2: Moving/Copying to another layer
             src_signature = self._get_layer_signature(src_atom, src_seg, src_layer, source_clips)
             
