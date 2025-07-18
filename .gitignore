@@ -13,3 +13,8 @@ build/main/localpycs/pyimod02_importers.pyc
 build/main/localpycs/pyimod03_ctypes.pyc
 build/main/localpycs/pyimod04_pywin32.pyc
 build/main/localpycs/struct.pyc
+__pycache__/app_logic.cpython-312.pyc
+__pycache__/app_logic.cpython-312.pyc
+__pycache__/conftest.cpython-312-pytest-8.4.1.pyc
+__pycache__/main.cpython-312.pyc
+__pycache__/test_app_logic.cpython-312-pytest-8.4.1.pyc

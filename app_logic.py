@@ -77,7 +77,6 @@ class AppLogic(QObject):
         elif not self.current_file_path:
              self.current_file_path = "Unsaved File *"
 
-        self.file_changed.emit(os.path.basename(self.current_file_path))
         self.clips_updated.emit()
     
     def get_layer_clips(self, atom_id, segment_name, layer_name):
@@ -404,7 +403,7 @@ class AppLogic(QObject):
             
             self.current_file_path = clean_path
             self.log_requested.emit(f"File saved: {clean_path}")
-            self.file_changed.emit(clean_path)
+            self.clips_updated.emit()
 
         except Exception as e:
             self.error_occurred.emit("Save Error", f"Save failed: {e}")

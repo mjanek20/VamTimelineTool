@@ -8,6 +8,7 @@ import copy
 from app_logic import AppLogic, MergeError
 from data_models import AnimationFile, AnimationClip, ControllerTarget, FloatParameter, TriggerGroup
 from keyframe_logic import KeyframeEncoder, KeyframeDecoder
+from main import MainWindow # Import MainWindow dla testów UI
 
 # --- Fixtures: Dane testowe i obiekty pomocnicze ---
 
@@ -339,3 +340,90 @@ class TestFileMerging:
         
         with pytest.raises(MergeError, match="Cannot merge a scene file"):
             app_logic_instance.merge_animation_file(scene_path, "rename")
+
+
+@pytest.mark.qt
+class TestUIInteractions:
+    @pytest.fixture
+    def main_window(self, qtbot):
+        """Fixture do tworzenia instancji MainWindow dla testów UI."""
+        window = MainWindow()
+        qtbot.addWidget(window)
+        return window
+
+    def find_item_by_text(self, tree, text):
+        """Pomocnicza funkcja do znajdowania elementu w drzewie po tekście."""
+        for i in range(tree.topLevelItemCount()):
+            top_item = tree.topLevelItem(i)
+            found = self._find_item_recursive(top_item, text)
+            if found:
+                return found
+        return None
+
+    def _find_item_recursive(self, parent_item, text):
+        if parent_item.text(0) == text:
+            return parent_item
+        for i in range(parent_item.childCount()):
+            child_item = parent_item.child(i)
+            found = self._find_item_recursive(child_item, text)
+            if found:
+                return found
+        return None
+
+    def test_tree_state_preservation_on_reorder(self, main_window, qtbot, temp_json_file):
+        """
+        Testuje, czy stan rozwinięcia/zwinięcia drzewa jest zachowywany po operacji
+        zmieniającej kolejność klipów, która wywołuje odświeżenie widoku.
+        """
+        # 1. Przygotowanie danych i załadowanie pliku
+        test_data = {
+            "SerializeVersion": "4", "AtomType": "Person", "Clips": [
+                {"AnimationName": "Walk", "AnimationSegment": "Locomotion", "AnimationLayer": "Base", "AnimationLength": "2.0"},
+                {"AnimationName": "Walk_Slow", "AnimationSegment": "Locomotion", "AnimationLayer": "Base", "AnimationLength": "3.0"},
+                {"AnimationName": "Jump", "AnimationSegment": "Locomotion", "AnimationLayer": "Overlay", "AnimationLength": "1.0"},
+                {"AnimationName": "Wave", "AnimationSegment": "Gestures", "AnimationLayer": "Main", "AnimationLength": "1.5"},
+            ]
+        }
+        path = temp_json_file("reorder_test.json", test_data)
+        main_window.app_logic.load_file(path)
+        
+        # Początkowo drzewo jest całkowicie rozwinięte
+        locomotion_segment_item = self.find_item_by_text(main_window.tree, "Segment: Locomotion")
+        gestures_main_layer_item = self.find_item_by_text(main_window.tree, "  Layer: Main")
+        
+        assert locomotion_segment_item.isExpanded()
+        assert gestures_main_layer_item.isExpanded()
+
+        # 2. Ręczne zwinięcie niektórych węzłów
+        locomotion_segment_item.setExpanded(False)
+        gestures_main_layer_item.setExpanded(False)
+
+        assert not locomotion_segment_item.isExpanded()
+        assert not gestures_main_layer_item.isExpanded()
+
+        # 3. Wykonanie operacji, która odświeża drzewo (zmiana kolejności klipów)
+        clip_walk = next(c for c in main_window.app_logic.animation_file.clips if c.name == "Walk")
+        clip_walk_slow = next(c for c in main_window.app_logic.animation_file.clips if c.name == "Walk_Slow")
+        
+        layer_data = ('layer', '(Standalone)', 'Locomotion', 'Base')
+        dragged_ids = [id(clip_walk_slow)]
+        target_id = id(clip_walk)
+        
+        # Symulacja przeciągnięcia "Walk_Slow" nad "Walk"
+        main_window.app_logic.reorder_clips_in_layer(layer_data, dragged_ids, target_id, 'Above')
+
+        # 4. Weryfikacja
+        # Drzewo zostało odświeżone. Sprawdzamy, czy stan zwinięcia został zachowany.
+        locomotion_segment_item_after = self.find_item_by_text(main_window.tree, "Segment: Locomotion")
+        gestures_main_layer_item_after = self.find_item_by_text(main_window.tree, "  Layer: Main")
+        
+        assert locomotion_segment_item_after is not None
+        assert gestures_main_layer_item_after is not None
+
+        # To jest kluczowy test: węzły powinny pozostać zwinięte
+        assert not locomotion_segment_item_after.isExpanded()
+        assert not gestures_main_layer_item_after.isExpanded()
+
+        # Dodatkowo, sprawdźmy czy węzeł, który nie był zwinięty, pozostał rozwinięty
+        gestures_segment_item_after = self.find_item_by_text(main_window.tree, "Segment: Gestures")
+        assert gestures_segment_item_after.isExpanded()

@@ -84,17 +84,13 @@ class MainWindow(QMainWindow):
         self.app_logic.error_occurred.connect(self.show_error_message)
 
     def on_file_changed(self, file_path):
-        title = f"Timeliner - {file_path}" if file_path else "Timeliner"
-        self.setWindowTitle(title)
+        # This slot is now only called by app_logic.load_file()
+        if file_path:
+            self.last_directory = os.path.dirname(file_path)
+            self.settings.setValue("last_directory", self.last_directory)
         
-        if file_path and not file_path.endswith("*"):
-            clean_path = self.app_logic.current_file_path.replace(" *", "")
-            if os.path.exists(clean_path):
-                 self.last_directory = os.path.dirname(clean_path)
-                 self.settings.setValue("last_directory", self.last_directory)
-        
-        self.is_first_load = True # Treat every new file load as a "first load" for expansion
-        self.populate_animation_tree()
+        self.is_first_load = True # Reset expansion state for new file
+        self.populate_animation_tree() # Trigger the UI rebuild
 
     def get_tree_state(self):
         """Saves the expansion state of the tree."""
@@ -116,6 +112,12 @@ class MainWindow(QMainWindow):
             self._get_tree_state_recursive(item, state)
 
     def populate_animation_tree(self):
+        # First, update the window title based on the current state in app_logic
+        app_logic_path = self.app_logic.current_file_path
+        display_path = os.path.basename(app_logic_path) if app_logic_path else ""
+        title = f"Timeliner - {display_path}" if display_path else "Timeliner"
+        self.setWindowTitle(title)
+        
         self.tree.blockSignals(True)
         
         try:
