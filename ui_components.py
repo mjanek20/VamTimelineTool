@@ -2,7 +2,7 @@
 import copy
 
 from PyQt6.QtCore import Qt, QMimeData
-from PyQt6.QtGui import QIcon, QDrag, QColor, QBrush, QPalette
+from PyQt6.QtGui import QIcon, QDrag, QColor, QBrush
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QTreeWidget, QAbstractItemView, QLabel, QMenu,
     QMessageBox, QLineEdit, QListWidget, QListWidgetItem, QFormLayout, QDialog, QDialogButtonBox,
@@ -57,26 +57,33 @@ class AnimationTreeWidget(QTreeWidget):
         self.customContextMenuRequested.connect(self.open_context_menu)
         # Double Click
         self.itemDoubleClicked.connect(self.on_item_double_clicked)
-        # Internal state for enhanced D&D
+        
+        # Custom widget for persistent drag-and-drop tooltips
+        self.drag_indicator_label = QLabel(self, Qt.WindowType.ToolTip)
+        self.drag_indicator_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.drag_indicator_label.setStyleSheet("""
+            QLabel {
+                background-color: #333;
+                color: white;
+                border: 1px solid #555;
+                padding: 4px;
+                border-radius: 3px;
+            }
+        """)
+        self.drag_indicator_label.hide()
+        
         self.dragged_items_data = None
         self.last_highlighted_item = None
-        self.last_tooltip_text = ""
-        self.last_tooltip_pos = None
 
     def _clear_drop_indicator(self):
         """Resets the background color of the last highlighted item."""
         if self.last_highlighted_item:
-            # Check if the C++ object still exists before trying to modify it
             try:
                 if self.last_highlighted_item.treeWidget() is not None:
                     self.last_highlighted_item.setBackground(0, QBrush())
             except RuntimeError:
-                # This catches the "wrapped C/C++ object has been deleted" error
                 pass
         self.last_highlighted_item = None
-        QToolTip.hideText()
-        self.last_tooltip_text = ""
-        self.last_tooltip_pos = None
 
     def startDrag(self, supportedActions):
         items = self.selectedItems()
@@ -101,6 +108,8 @@ class AnimationTreeWidget(QTreeWidget):
         drag.exec(supportedActions)
         
         # Final cleanup after the operation is fully complete
+        self.drag_indicator_label.hide()
+        self._clear_drop_indicator()
         self.dragged_items_data = None
         
     def dragEnterEvent(self, event):
@@ -109,65 +118,71 @@ class AnimationTreeWidget(QTreeWidget):
     def dragMoveEvent(self, event):
         target_item = self.itemAt(event.position().toPoint())
         
-        tooltip_pos = self.viewport().mapToGlobal(event.position().toPoint())
-        current_tooltip_text = ""
-        
         # Clear previous highlight if the target changed
         if self.last_highlighted_item and self.last_highlighted_item != target_item:
             self._clear_drop_indicator()
 
         if not target_item or not self.dragged_items_data:
-            current_tooltip_text = "<b>Invalid:</b> Cannot drop here."
+            self.drag_indicator_label.hide()
             event.ignore()
-        else:
-            is_child = False
-            parent = target_item
-            while parent:
-                if parent.data(0, 1000) in self.dragged_items_data:
-                    is_child = True
-                    break
-                parent = parent.parent()
-            
-            if target_item.data(0, 1000) in self.dragged_items_data or is_child:
-                current_tooltip_text = "<b>Invalid:</b> Cannot drop on itself or a child."
-                event.ignore()
-            else:
-                target_data = target_item.data(0, 1000)
-                modifiers = QApplication.keyboardModifiers()
-                is_copy = (modifiers & Qt.KeyboardModifier.ControlModifier) == Qt.KeyboardModifier.ControlModifier
-                action_type, details = self.parent_window.app_logic.predict_drop_action(self.dragged_items_data, target_data, is_copy)
-                
-                self.last_highlighted_item = target_item
-                
-                if action_type in [DropActionType.REORDER_CLIPS, DropActionType.MOVE_CLIPS_COMPATIBLE, DropActionType.COPY_CLIPS_COMPATIBLE]:
-                    target_item.setBackground(0, QColor("#2a4"))
-                    current_tooltip_text = f"<b>OK:</b> {details}"
-                    event.acceptProposedAction()
-                elif action_type in [DropActionType.MOVE_CLIPS_NEW_LAYER, DropActionType.COPY_CLIPS_NEW_LAYER]:
-                    target_item.setBackground(0, QColor("#27a"))
-                    current_tooltip_text = f"<b>Info:</b> {details}"
-                    event.acceptProposedAction()
-                elif action_type == DropActionType.MERGE_LAYERS:
-                    target_item.setBackground(0, QColor("#c82"))
-                    current_tooltip_text = f"<b>Warning:</b> {details}"
-                    event.acceptProposedAction()
-                else:
-                    target_item.setBackground(0, QColor("#800"))
-                    current_tooltip_text = f"<b>Invalid:</b> {details}"
-                    event.ignore()
+            return
         
-        if current_tooltip_text != self.last_tooltip_text or (self.last_tooltip_pos and (tooltip_pos - self.last_tooltip_pos).manhattanLength() > 10):
-            self.last_tooltip_text = current_tooltip_text
-            self.last_tooltip_pos = tooltip_pos
-            QToolTip.showText(tooltip_pos, current_tooltip_text, self)
+        is_child = False
+        parent = target_item
+        while parent:
+            if parent.data(0, 1000) in self.dragged_items_data:
+                is_child = True
+                break
+            parent = parent.parent()
+        
+        if target_item.data(0, 1000) in self.dragged_items_data or is_child:
+            self.drag_indicator_label.hide()
+            self._clear_drop_indicator()
+            event.ignore()
+            return
+
+        target_data = target_item.data(0, 1000)
+        modifiers = QApplication.keyboardModifiers()
+        is_copy = (modifiers & Qt.KeyboardModifier.ControlModifier) == Qt.KeyboardModifier.ControlModifier
+        action_type, details = self.parent_window.app_logic.predict_drop_action(self.dragged_items_data, target_data, is_copy)
+        
+        self.last_highlighted_item = target_item
+        
+        tooltip_text = ""
+        if action_type in [DropActionType.REORDER_CLIPS, DropActionType.MOVE_CLIPS_COMPATIBLE, DropActionType.COPY_CLIPS_COMPATIBLE]:
+            target_item.setBackground(0, QColor("#2a4"))
+            tooltip_text = f"<b>OK:</b> {details}"
+            event.acceptProposedAction()
+        elif action_type in [DropActionType.MOVE_CLIPS_NEW_LAYER, DropActionType.COPY_CLIPS_NEW_LAYER]:
+            target_item.setBackground(0, QColor("#27a"))
+            tooltip_text = f"<b>Info:</b> {details}"
+            event.acceptProposedAction()
+        elif action_type == DropActionType.MERGE_LAYERS:
+            target_item.setBackground(0, QColor("#c82"))
+            tooltip_text = f"<b>Warning:</b> {details}"
+            event.acceptProposedAction()
+        else:
+            target_item.setBackground(0, QColor("#800"))
+            tooltip_text = f"<b>Invalid:</b> {details}"
+            event.ignore()
+        
+        self.drag_indicator_label.setText(tooltip_text)
+        
+        # --- FIX: Use mapToGlobal on the widget's viewport ---
+        pos = self.viewport().mapToGlobal(event.position().toPoint())
+        self.drag_indicator_label.move(pos.x() + 15, pos.y() + 15)
+        self.drag_indicator_label.show()
+        self.drag_indicator_label.adjustSize()
+
             
     def dragLeaveEvent(self, event):
         self._clear_drop_indicator()
+        self.drag_indicator_label.hide()
         event.accept()
 
     def dropEvent(self, event):
-        # --- FIX: Clean up visual state BEFORE executing logic ---
         self._clear_drop_indicator()
+        self.drag_indicator_label.hide()
 
         if not self.dragged_items_data:
             event.ignore()
