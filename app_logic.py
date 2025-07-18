@@ -9,6 +9,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from data_models import AnimationFile, AnimationClip, FloatParameter, ControllerTarget, TriggerGroup
 from keyframe_logic import KeyframeEncoder, KeyframeDecoder
+from enums import DropActionType
 
 class MergeError(Exception):
     """Custom exception for merge failures."""
@@ -25,6 +26,69 @@ class AppLogic(QObject):
         self.animation_file = None
         self.current_file_path = None
         self.last_center_root_delta_xz = (0.0, 0.0)
+
+    def predict_drop_action(self, dragged_items_data, target_item_data, is_copy):
+        """Predicts the outcome of a drop action without executing it."""
+        if not dragged_items_data or not target_item_data:
+            return DropActionType.INVALID, "No valid items."
+
+        source_data = dragged_items_data[0]
+        
+        # --- Clip Drag Logic ---
+        if isinstance(source_data, AnimationClip):
+            source_clips = dragged_items_data
+            
+            # Determine target layer
+            target_layer_data = None
+            if isinstance(target_item_data, AnimationClip):
+                target_layer_data = ('layer', target_item_data.atom_id, target_item_data.segment, target_item_data.layer)
+            elif isinstance(target_item_data, tuple) and target_item_data[0] == 'layer':
+                target_layer_data = target_item_data
+            
+            if not target_layer_data:
+                return DropActionType.INVALID, "Clips can only be dropped on other clips or layers."
+
+            src_atom, src_seg, src_layer = source_data.atom_id, source_data.segment, source_data.layer
+            tgt_atom, tgt_seg, tgt_layer = target_layer_data[1], target_layer_data[2], target_layer_data[3]
+
+            # Scenario 1: Reordering within the same layer
+            if not is_copy and (src_atom, src_seg, src_layer) == (tgt_atom, tgt_seg, tgt_layer):
+                return DropActionType.REORDER_CLIPS, "Reorder clips"
+
+            # Scenario 2: Moving/Copying to another layer
+            src_signature = self._get_layer_signature(src_atom, src_seg, src_layer, source_clips)
+            
+            # Check for empty target layer
+            other_clips_in_target = [c for c in self.get_layer_clips(tgt_atom, tgt_seg, tgt_layer) if c not in source_clips]
+            
+            if not other_clips_in_target:
+                action = DropActionType.COPY_CLIPS_COMPATIBLE if is_copy else DropActionType.MOVE_CLIPS_COMPATIBLE
+                return action, f"{'Copy' if is_copy else 'Move'} to empty layer '{tgt_layer}'"
+
+            tgt_signature = self._get_layer_signature(tgt_atom, tgt_seg, tgt_layer, other_clips_in_target)
+            
+            if src_signature == tgt_signature:
+                action = DropActionType.COPY_CLIPS_COMPATIBLE if is_copy else DropActionType.MOVE_CLIPS_COMPATIBLE
+                return action, f"{'Copy' if is_copy else 'Move'} to compatible layer '{tgt_layer}'"
+            else:
+                action = DropActionType.COPY_CLIPS_NEW_LAYER if is_copy else DropActionType.MOVE_CLIPS_NEW_LAYER
+                verb = 'Copy' if is_copy else 'Move'
+                return action, f"{verb} and create a new layer in '{tgt_seg}'"
+
+        # --- Layer Drag Logic ---
+        elif isinstance(source_data, tuple) and source_data[0] == 'layer':
+            if not (isinstance(target_item_data, tuple) and target_item_data[0] == 'layer'):
+                return DropActionType.INVALID, "Layers can only be dropped on other layers."
+            
+            src_atom, src_seg = source_data[1], source_data[2]
+            tgt_atom, tgt_seg = target_item_data[1], target_item_data[2]
+            
+            if src_atom == tgt_atom and src_seg == tgt_seg:
+                return DropActionType.MERGE_LAYERS, f"Merge '{source_data[3]}' into '{target_item_data[3]}'"
+            else:
+                return DropActionType.INVALID, "Layers can only be merged within the same segment."
+        
+        return DropActionType.INVALID, "Unknown drag operation."
 
     def load_file(self, file_name):
         try:

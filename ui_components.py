@@ -2,15 +2,15 @@
 import copy
 
 from PyQt6.QtCore import Qt, QMimeData
-from PyQt6.QtGui import QIcon, QDrag
+from PyQt6.QtGui import QIcon, QDrag, QColor, QBrush, QPalette
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QTreeWidget, QAbstractItemView, QLabel, QMenu,
     QMessageBox, QLineEdit, QListWidget, QListWidgetItem, QFormLayout, QDialog, QDialogButtonBox,
-    QRadioButton
+    QRadioButton, QToolTip, QApplication
 )
 
 from data_models import AnimationClip, FloatParameter, ControllerTarget, TriggerGroup
-from keyframe_logic import KeyframeEncoder
+from enums import DropActionType
 
 class DeleteTargetScopeDialog(QDialog):
     """A dialog to ask the user the scope of the target deletion."""
@@ -46,15 +46,142 @@ class AnimationTreeWidget(QTreeWidget):
     def __init__(self, parent_window):
         super().__init__()
         self.parent_window = parent_window
+        # Drag & Drop setup
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # Context Menu
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.open_context_menu)
+        # Double Click
         self.itemDoubleClicked.connect(self.on_item_double_clicked)
-    
+        # Internal state for enhanced D&D
+        self.dragged_items_data = None
+        self.last_highlighted_item = None
+        self.last_tooltip_text = ""
+        self.last_tooltip_pos = None
+
+    def _clear_drop_indicator(self):
+        """Resets the background color of the last highlighted item."""
+        if self.last_highlighted_item:
+            # Check if the C++ object still exists before trying to modify it
+            try:
+                if self.last_highlighted_item.treeWidget() is not None:
+                    self.last_highlighted_item.setBackground(0, QBrush())
+            except RuntimeError:
+                # This catches the "wrapped C/C++ object has been deleted" error
+                pass
+        self.last_highlighted_item = None
+        QToolTip.hideText()
+        self.last_tooltip_text = ""
+        self.last_tooltip_pos = None
+
+    def startDrag(self, supportedActions):
+        items = self.selectedItems()
+        if not items: return
+        
+        self.dragged_items_data = [item.data(0, 1000) for item in items]
+        
+        data = self.dragged_items_data[0]
+        mime_data = QMimeData()
+        if isinstance(data, AnimationClip):
+            mime_data.setText("clip-drag")
+        elif isinstance(data, tuple) and data[0] == 'layer':
+            if len(items) > 1: return
+            mime_data.setText("layer-drag")
+        else:
+            self.dragged_items_data = None
+            return
+
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        
+        drag.exec(supportedActions)
+        
+        # Final cleanup after the operation is fully complete
+        self.dragged_items_data = None
+        
+    def dragEnterEvent(self, event):
+        event.accept()
+
+    def dragMoveEvent(self, event):
+        target_item = self.itemAt(event.position().toPoint())
+        
+        tooltip_pos = self.viewport().mapToGlobal(event.position().toPoint())
+        current_tooltip_text = ""
+        
+        # Clear previous highlight if the target changed
+        if self.last_highlighted_item and self.last_highlighted_item != target_item:
+            self._clear_drop_indicator()
+
+        if not target_item or not self.dragged_items_data:
+            current_tooltip_text = "<b>Invalid:</b> Cannot drop here."
+            event.ignore()
+        else:
+            is_child = False
+            parent = target_item
+            while parent:
+                if parent.data(0, 1000) in self.dragged_items_data:
+                    is_child = True
+                    break
+                parent = parent.parent()
+            
+            if target_item.data(0, 1000) in self.dragged_items_data or is_child:
+                current_tooltip_text = "<b>Invalid:</b> Cannot drop on itself or a child."
+                event.ignore()
+            else:
+                target_data = target_item.data(0, 1000)
+                modifiers = QApplication.keyboardModifiers()
+                is_copy = (modifiers & Qt.KeyboardModifier.ControlModifier) == Qt.KeyboardModifier.ControlModifier
+                action_type, details = self.parent_window.app_logic.predict_drop_action(self.dragged_items_data, target_data, is_copy)
+                
+                self.last_highlighted_item = target_item
+                
+                if action_type in [DropActionType.REORDER_CLIPS, DropActionType.MOVE_CLIPS_COMPATIBLE, DropActionType.COPY_CLIPS_COMPATIBLE]:
+                    target_item.setBackground(0, QColor("#2a4"))
+                    current_tooltip_text = f"<b>OK:</b> {details}"
+                    event.acceptProposedAction()
+                elif action_type in [DropActionType.MOVE_CLIPS_NEW_LAYER, DropActionType.COPY_CLIPS_NEW_LAYER]:
+                    target_item.setBackground(0, QColor("#27a"))
+                    current_tooltip_text = f"<b>Info:</b> {details}"
+                    event.acceptProposedAction()
+                elif action_type == DropActionType.MERGE_LAYERS:
+                    target_item.setBackground(0, QColor("#c82"))
+                    current_tooltip_text = f"<b>Warning:</b> {details}"
+                    event.acceptProposedAction()
+                else:
+                    target_item.setBackground(0, QColor("#800"))
+                    current_tooltip_text = f"<b>Invalid:</b> {details}"
+                    event.ignore()
+        
+        if current_tooltip_text != self.last_tooltip_text or (self.last_tooltip_pos and (tooltip_pos - self.last_tooltip_pos).manhattanLength() > 10):
+            self.last_tooltip_text = current_tooltip_text
+            self.last_tooltip_pos = tooltip_pos
+            QToolTip.showText(tooltip_pos, current_tooltip_text, self)
+            
+    def dragLeaveEvent(self, event):
+        self._clear_drop_indicator()
+        event.accept()
+
+    def dropEvent(self, event):
+        # --- FIX: Clean up visual state BEFORE executing logic ---
+        self._clear_drop_indicator()
+
+        if not self.dragged_items_data:
+            event.ignore()
+            return
+            
+        mime_text = event.mimeData().text()
+        
+        if mime_text == "clip-drag":
+            self.handle_clip_drop(event)
+        elif mime_text == "layer-drag":
+            self.handle_layer_merge(event)
+        else:
+            event.ignore()
+
     def on_item_double_clicked(self, item, column):
         self.parent_window.rename_selected_item()
         
@@ -66,69 +193,17 @@ class AnimationTreeWidget(QTreeWidget):
         else:
             super().keyPressEvent(event)
             
-    def dragEnterEvent(self, event):
-        if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]:
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-            
-    def dragMoveEvent(self, event):
-        if event.source() == self and event.mimeData().text() in ["clip-drag", "layer-drag"]:
-            event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
-            
-    def startDrag(self, supportedActions):
-        items = self.selectedItems()
-        if not items:
-            return
-        item = items[0]
-        drag = QDrag(self)
-        mime_data = QMimeData()
-        
-        data = item.data(0, 1000)
-        if isinstance(data, tuple) and data[0] == 'layer':
-            if len(items) > 1: return
-            mime_data.setText("layer-drag")
-            drag.setMimeData(mime_data)
-            drag.exec(Qt.DropAction.MoveAction)
-        elif isinstance(data, AnimationClip):
-            mime_data.setText("clip-drag")
-            drag.setMimeData(mime_data)
-            drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction, Qt.DropAction.MoveAction)
-            
-    def dropEvent(self, event):
-        mime_text = event.mimeData().text()
-        if mime_text == "clip-drag":
-            self.handle_clip_drop(event)
-        elif mime_text == "layer-drag":
-            self.handle_layer_merge(event)
-        else:
-            event.ignore()
-            
     def handle_layer_merge(self, event):
-        source_item = self.selectedItems()[0]
+        source_data = self.dragged_items_data[0]
         target_item_at_point = self.itemAt(event.position().toPoint())
         
-        src_data = source_item.data(0, 1000)
-        tgt_data = target_item_at_point.data(0, 1000) if target_item_at_point else None
+        target_layer_item = self.get_target_layer_item(target_item_at_point)
         
-        if not (src_data and isinstance(src_data, tuple) and src_data[0] == 'layer'):
-            event.ignore()
-            return
-
-        target_layer_item = None
-        if tgt_data:
-            if isinstance(tgt_data, tuple) and tgt_data[0] == 'layer':
-                target_layer_item = target_item_at_point
-            elif isinstance(tgt_data, AnimationClip):
-                target_layer_item = target_item_at_point.parent()
-        
-        if not target_layer_item or source_item == target_layer_item:
+        if not target_layer_item or source_data == target_layer_item.data(0, 1000):
             event.ignore()
             return
             
-        src_layer_name = src_data[3]
+        src_layer_name = source_data[3]
         tgt_layer_name = target_layer_item.data(0, 1000)[3]
         
         reply = QMessageBox.question(self, 'Confirm Layer Merge', 
@@ -137,44 +212,48 @@ class AnimationTreeWidget(QTreeWidget):
                                      QMessageBox.StandardButton.No)
         
         if reply == QMessageBox.StandardButton.Yes:
-            self.parent_window.app_logic.merge_layers(src_data, target_layer_item.data(0, 1000))
+            self.parent_window.app_logic.merge_layers(source_data, target_layer_item.data(0, 1000))
             event.acceptProposedAction()
         else:
             event.ignore()
 
-    def handle_clip_drop(self, event):
-        source_items = self.selectedItems()
-        target_item = self.itemAt(event.position().toPoint())
-        if not source_items or not target_item:
-            event.ignore()
-            return
-            
-        is_copy = event.proposedAction() == Qt.DropAction.CopyAction
-        source_layer_item = source_items[0].parent()
-        
-        target_layer_item = None
-        target_clip_for_pos = None
+    def get_target_layer_item(self, target_item):
+        """Helper to find the layer item from a drop target."""
+        if not target_item:
+            return None
         
         target_data = target_item.data(0, 1000)
         if isinstance(target_data, AnimationClip):
-            target_layer_item = target_item.parent()
-            target_clip_for_pos = target_item
+            return target_item.parent()
         elif isinstance(target_data, tuple) and target_data[0] == 'layer':
-            target_layer_item = target_item
+            return target_item
+        return None
+
+    def handle_clip_drop(self, event):
+        target_item = self.itemAt(event.position().toPoint())
+        if not target_item:
+            event.ignore(); return
+            
+        is_copy = (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier) == Qt.KeyboardModifier.ControlModifier
+        
+        source_clip_sample = self.dragged_items_data[0]
+        source_layer_data = ('layer', source_clip_sample.atom_id, source_clip_sample.segment, source_clip_sample.layer)
+        
+        target_layer_item = self.get_target_layer_item(target_item)
         
         if not target_layer_item:
-            event.ignore()
-            return
+            event.ignore(); return
             
         app_logic = self.parent_window.app_logic
-        dragged_clips_ids = {id(item.data(0, 1000)) for item in source_items}
+        dragged_clips_ids = {id(item) for item in self.dragged_items_data}
         
-        if not is_copy and source_layer_item == target_layer_item:
+        if not is_copy and source_layer_data == target_layer_item.data(0, 1000): # Reorder
             drop_pos_enum = self.dropIndicatorPosition()
             drop_pos = 'Below' if drop_pos_enum == QAbstractItemView.DropIndicatorPosition.BelowItem else 'Above'
+            target_clip_for_pos = target_item if isinstance(target_item.data(0, 1000), AnimationClip) else None
             target_clip_id = id(target_clip_for_pos.data(0, 1000)) if target_clip_for_pos else None
             app_logic.reorder_clips_in_layer(target_layer_item.data(0, 1000), dragged_clips_ids, target_clip_id, drop_pos)
-        else:
+        else: # Move or Copy
             app_logic.move_or_copy_clips_to_layer(dragged_clips_ids, target_layer_item.data(0, 1000), is_copy)
         
         event.acceptProposedAction()
@@ -185,16 +264,23 @@ class AnimationTreeWidget(QTreeWidget):
         if selected:
             if len(selected) == 1:
                 item = selected[0]
-                rename_action = menu.addAction("Rename...")
-                rename_action.setShortcut("F2")
-                rename_action.triggered.connect(self.parent_window.rename_selected_item)
-                if isinstance(item.data(0, 1000), AnimationClip):
+                data = item.data(0, 1000)
+                if isinstance(data, tuple) and data[0] in ['segment', 'layer']:
+                    rename_action = menu.addAction("Rename...")
+                    rename_action.setShortcut("F2")
+                    rename_action.triggered.connect(self.parent_window.rename_selected_item)
+                elif isinstance(data, AnimationClip):
+                    rename_action = menu.addAction("Rename...")
+                    rename_action.setShortcut("F2")
+                    rename_action.triggered.connect(self.parent_window.rename_selected_item)
                     duplicate_action = menu.addAction("Duplicate Clip")
                     duplicate_action.setShortcut("Ctrl+D")
                     duplicate_action.triggered.connect(self.parent_window.duplicate_selected_clip)
-            delete_action = menu.addAction(QIcon.fromTheme("edit-delete"), f"Delete {len(selected)} item(s)")
+
+            delete_action = menu.addAction(f"Delete {len(selected)} item(s)")
             delete_action.setShortcut("Delete")
             delete_action.triggered.connect(self.parent_window.delete_selected_items)
+
         if not menu.isEmpty():
             menu.exec(self.viewport().mapToGlobal(position))
 

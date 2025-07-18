@@ -8,6 +8,7 @@ import copy
 from app_logic import AppLogic, MergeError
 from data_models import AnimationFile, AnimationClip, ControllerTarget, FloatParameter, TriggerGroup
 from keyframe_logic import KeyframeEncoder, KeyframeDecoder
+from enums import DropActionType
 from main import MainWindow # Import MainWindow dla testów UI
 
 # --- Fixtures: Dane testowe i obiekty pomocnicze ---
@@ -133,6 +134,7 @@ class TestAppLogic:
         
     def test_rename_clip_and_update_references(self, app_logic_instance):
         clip1 = AnimationClip("First", "S1", "L1", 1.0)
+        # POPRAWKA: Przekazujemy argument bezpośrednio, a nie w zagnieżdżonym słowniku
         clip2 = AnimationClip("Second", "S1", "L1", 1.0, NextAnimationName="First")
         app_logic_instance.animation_file = AnimationFile()
         app_logic_instance.animation_file.clips = [clip1, clip2]
@@ -210,7 +212,6 @@ class TestAppLogic:
         assert clip_s1a.segment == "Seg2" and clip_s1a.layer == "LayerB"
 
     def test_move_clip_creates_new_layer(self, app_logic_instance):
-        # POPRAWKA: Przywrócono dodawanie kontrolerów, aby sygnatury warstw były różne.
         clip_s1a = AnimationClip("S1A", "Seg1", "LayerA", 1.0, atom_id="A1")
         clip_s1a.controllers.append(ControllerTarget("hipControl")) # Sygnatura A
         
@@ -223,14 +224,12 @@ class TestAppLogic:
         
         app_logic_instance.move_or_copy_clips_to_layer([id(clip_s1a)], target_layer_data, is_copy=False)
         
-        # Klip powinien zostać przeniesiony do nowej warstwy 'LayerA' w 'Seg2'
         assert clip_s1a.segment == "Seg2" and clip_s1a.layer == "LayerA"
 
     def test_move_clip_creates_renamed_layer(self, app_logic_instance):
         clip_s1a = AnimationClip("S1A", "Seg1", "LayerA", 1.0, atom_id="A1")
         clip_s1a.controllers.append(ControllerTarget("hipControl"))
         clip_s2a = AnimationClip("S2A", "Seg2", "LayerA", 1.0, atom_id="A1")
-        # Ważne: inna sygnatura, mimo tej samej nazwy warstwy
         clip_s2a.controllers.append(ControllerTarget("chestControl"))
         
         app_logic_instance.animation_file = AnimationFile()
@@ -272,7 +271,6 @@ class TestAppLogic:
         app_logic_instance.animation_file = AnimationFile()
         app_logic_instance.animation_file.clips = clips
         
-        # POPRAWKA: Dodano brakujące argumenty 'prefix' i 'suffix'
         app_logic_instance.batch_rename_clips(clips, find="Anim_", replace="Motion_", prefix="", suffix="")
         
         names = {c.name for c in app_logic_instance.animation_file.clips}
@@ -347,6 +345,91 @@ class TestAppLogic:
         # The clip in another segment should be untouched
         assert len(clip_other_seg.controllers) == 2
         assert clip_other_seg.layer == "Base"
+
+class TestDropPrediction:
+    @pytest.fixture
+    def app_logic_with_clips(self, app_logic_instance):
+        """Provides an AppLogic instance with a predefined set of clips for D&D tests."""
+        ct_hip = ControllerTarget("hipControl")
+        ct_chest = ControllerTarget("chestControl")
+        
+        # Layer "Base" has hip and chest controls
+        clip_a = AnimationClip("A", "S1", "Base", 1.0)
+        clip_a.controllers = [copy.deepcopy(ct_hip), copy.deepcopy(ct_chest)]
+        
+        # Layer "Simple" has only hip control
+        clip_b = AnimationClip("B", "S1", "Simple", 1.0)
+        clip_b.controllers = [copy.deepcopy(ct_hip)]
+
+        # Another clip for reordering
+        clip_c = AnimationClip("C", "S1", "Base", 1.0)
+        clip_c.controllers = [copy.deepcopy(ct_hip), copy.deepcopy(ct_chest)]
+
+        app_logic_instance.animation_file = AnimationFile()
+        app_logic_instance.animation_file.clips = [clip_a, clip_b, clip_c]
+        return app_logic_instance
+    
+    def test_predict_reorder(self, app_logic_with_clips):
+        logic = app_logic_with_clips
+        clip_a = logic.animation_file.clips[0]
+        clip_c = logic.animation_file.clips[2]
+        
+        action, _ = logic.predict_drop_action([clip_a], clip_c, is_copy=False)
+        assert action == DropActionType.REORDER_CLIPS
+    
+    def test_predict_move_to_compatible(self, app_logic_with_clips):
+        logic = app_logic_with_clips
+        # Create a new clip with the same signature as "Simple" layer
+        clip_d = AnimationClip("D", "S2", "Other", 1.0)
+        clip_d.controllers.append(ControllerTarget("hipControl"))
+        logic.animation_file.clips.append(clip_d)
+        
+        target_clip = logic.animation_file.clips[1] # clip_b in "Simple" layer
+        
+        action, _ = logic.predict_drop_action([clip_d], target_clip, is_copy=False)
+        assert action == DropActionType.MOVE_CLIPS_COMPATIBLE
+
+    def test_predict_move_to_incompatible(self, app_logic_with_clips):
+        logic = app_logic_with_clips
+        clip_a = logic.animation_file.clips[0] # From "Base" layer (2 controllers)
+        clip_b = logic.animation_file.clips[1] # From "Simple" layer (1 controller)
+        
+        # Try to move clip A to layer "Simple"
+        action, _ = logic.predict_drop_action([clip_a], clip_b, is_copy=False)
+        assert action == DropActionType.MOVE_CLIPS_NEW_LAYER
+
+    def test_predict_copy_to_incompatible(self, app_logic_with_clips):
+        logic = app_logic_with_clips
+        clip_a = logic.animation_file.clips[0] # From "Base" layer
+        clip_b = logic.animation_file.clips[1] # From "Simple" layer
+        
+        action, _ = logic.predict_drop_action([clip_a], clip_b, is_copy=True)
+        assert action == DropActionType.COPY_CLIPS_NEW_LAYER
+
+    def test_predict_merge_layers(self, app_logic_with_clips):
+        logic = app_logic_with_clips
+        # Data for layers "Base" and "Simple"
+        layer_base_data = ('layer', '(Standalone)', 'S1', 'Base')
+        layer_simple_data = ('layer', '(Standalone)', 'S1', 'Simple')
+
+        action, _ = logic.predict_drop_action([layer_simple_data], layer_base_data, is_copy=False)
+        assert action == DropActionType.MERGE_LAYERS
+
+    def test_predict_invalid_merge_across_segments(self, app_logic_with_clips):
+        logic = app_logic_with_clips
+        layer_s1_data = ('layer', '(Standalone)', 'S1', 'Base')
+        layer_s2_data = ('layer', '(Standalone)', 'S2', 'Other')
+
+        action, _ = logic.predict_drop_action([layer_s1_data], layer_s2_data, is_copy=False)
+        assert action == DropActionType.INVALID
+
+    def test_predict_invalid_drop_clip_on_segment(self, app_logic_with_clips):
+        logic = app_logic_with_clips
+        clip_a = logic.animation_file.clips[0]
+        segment_data = ('segment', '(Standalone)', 'S1')
+
+        action, _ = logic.predict_drop_action([clip_a], segment_data, is_copy=False)
+        assert action == DropActionType.INVALID
 
 class TestFileMerging:
     @pytest.fixture
