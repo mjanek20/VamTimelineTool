@@ -862,3 +862,179 @@ class TestTransformations:
         
         # Plik nie powinien być oznaczony jako zmodyfikowany
         assert logic.current_file_path == "test.json"
+
+@pytest.fixture
+def clip_for_transform_test(app_logic_instance):
+    """
+    Dostarcza instancję AppLogic z klipem, który ma kontroler 'hipControl'
+    i 'rHandControl' do testowania transformacji.
+    - hipControl at (10, 0, 0)
+    - rHandControl at (11, 1, 0) -> Względnie (1, 1, 0) do hip
+    """
+    clip = AnimationClip("TransformTest", "S1", "L1", 2.0)
+    
+    # Root controller
+    hip = ControllerTarget("hipControl")
+    hip.properties["X"] = [KeyframeEncoder.encode_keyframe(0.0, 10.0, 3, 0, 0)]
+    hip.properties["Y"] = [KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0, 0)]
+    hip.properties["Z"] = [KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0, 0)]
+    hip.properties["RotW"] = [KeyframeEncoder.encode_keyframe(0.0, 1.0, 3, 0, 0)]
+    
+    # Hand controller
+    hand = ControllerTarget("rHandControl")
+    hand.properties["X"] = [KeyframeEncoder.encode_keyframe(0.0, 11.0, 3, 0, 0)]
+    hand.properties["Y"] = [KeyframeEncoder.encode_keyframe(0.0, 1.0, 3, 0, 0)]
+    hand.properties["Z"] = [KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0, 0)]
+    hand.properties["RotW"] = [KeyframeEncoder.encode_keyframe(0.0, 1.0, 3, 0, 0)]
+
+    clip.controllers.extend([hip, hand])
+    app_logic_instance.animation_file = AnimationFile()
+    app_logic_instance.animation_file.clips = [clip]
+    
+    return app_logic_instance, clip
+
+class TestTransformations:
+
+    def test_transform_local_rotation_with_movement(self, clip_for_transform_test):
+        logic, clip = clip_for_transform_test
+        hip = next(c for c in clip.controllers if c.id == 'hipControl')
+        hand = next(c for c in clip.controllers if c.id == 'rHandControl')
+
+        # Add a second keyframe where hip moves forward
+        # Original hip pos at t=1: (10, 0, 5)
+        # Original hand pos at t=1: (11, 1, 5)
+        hip.properties["Z"].append(KeyframeEncoder.encode_keyframe(1.0, 5.0, 3, 0.0, 3))
+        hand.properties["Z"].append(KeyframeEncoder.encode_keyframe(1.0, 5.0, 3, 0.0, 3))
+        
+        pos_offset = (0.0, 0.0, 0.0)
+        rot_offset = (0.0, 90.0, 0.0)
+        
+        logic.transform_root_by_offset([clip], pos_offset, rot_offset, "local")
+        
+        # Pivot point is hip's initial position: (10, 0, 0)
+
+        # --- VERIFY KEYFRAME at t=1.0 ---
+        # Hip original pos (10,0,5) -> vector from pivot (0,0,5) -> rotated vector (5,0,0)
+        # New hip pos = pivot + rotated_vec = (10,0,0) + (5,0,0) = (15,0,0)
+        _, hip_x_kf1, _ = KeyframeDecoder.decode_keyframe(hip.properties["X"][0], 0, 0)
+        _, hip_z_kf1, _ = KeyframeDecoder.decode_keyframe(hip.properties["Z"][0], 0, 0)
+        _, hip_x_kf2, _ = KeyframeDecoder.decode_keyframe(hip.properties["X"][1], hip_x_kf1, 3)
+        _, hip_y_kf2, _ = KeyframeDecoder.decode_keyframe(hip.properties["Y"][1], 0, 3) # Handled by logic
+        _, hip_z_kf2, _ = KeyframeDecoder.decode_keyframe(hip.properties["Z"][1], hip_z_kf1, 3)
+        assert hip_x_kf2 == pytest.approx(15.0)
+        assert hip_y_kf2 == pytest.approx(0.0)
+        assert hip_z_kf2 == pytest.approx(0.0, abs=1e-6)
+
+        # Hand original pos (11,1,5) -> vector from pivot (1,1,5) -> rotated vector (5,1,-1)
+        # New hand pos = pivot + rotated_vec = (10,0,0) + (5,1,-1) = (15,1,-1)
+        _, hand_x_kf1, _ = KeyframeDecoder.decode_keyframe(hand.properties["X"][0], 0, 0)
+        _, hand_z_kf1, _ = KeyframeDecoder.decode_keyframe(hand.properties["Z"][0], 0, 0)
+        _, hand_x_kf2, _ = KeyframeDecoder.decode_keyframe(hand.properties["X"][1], hand_x_kf1, 3)
+        _, hand_y_kf2, _ = KeyframeDecoder.decode_keyframe(hand.properties["Y"][1], 1.0, 3)
+        _, hand_z_kf2, _ = KeyframeDecoder.decode_keyframe(hand.properties["Z"][1], hand_z_kf1, 3)
+        assert hand_x_kf2 == pytest.approx(15.0)
+        assert hand_y_kf2 == pytest.approx(1.0)
+        assert hand_z_kf2 == pytest.approx(-1.0)
+
+    def test_transform_position_only(self, clip_for_transform_test):
+        logic, clip = clip_for_transform_test
+        hip = clip.controllers[0]
+        hand = clip.controllers[1]
+        
+        pos_offset = (1.5, -2.0, 3.5)
+        rot_offset = (0.0, 0.0, 0.0)
+        
+        logic.transform_root_by_offset([clip], pos_offset, rot_offset, "global")
+        
+        # Hip: (10,0,0) + offset -> (11.5, -2.0, 3.5)
+        _, hip_x, _ = KeyframeDecoder.decode_keyframe(hip.properties["X"][0], 0, 0)
+        _, hip_y, _ = KeyframeDecoder.decode_keyframe(hip.properties["Y"][0], 0, 0)
+        assert hip_x == pytest.approx(11.5)
+        assert hip_y == pytest.approx(-2.0)
+
+        # Hand: (11,1,0) + offset -> (12.5, -1.0, 3.5)
+        _, hand_x, _ = KeyframeDecoder.decode_keyframe(hand.properties["X"][0], 0, 0)
+        _, hand_y, _ = KeyframeDecoder.decode_keyframe(hand.properties["Y"][0], 0, 0)
+        assert hand_x == pytest.approx(12.5)
+        assert hand_y == pytest.approx(-1.0)
+        
+        # Rotations should be unchanged
+        _, hip_w, _ = KeyframeDecoder.decode_keyframe(hip.properties["RotW"][0], 0, 0)
+        assert hip_w == pytest.approx(1.0)
+
+    def test_transform_global_rotation_only_yaw(self, clip_for_transform_test):
+        logic, clip = clip_for_transform_test
+        hip = clip.controllers[0]
+        hand = clip.controllers[1]
+        
+        pos_offset = (0.0, 0.0, 0.0)
+        rot_offset = (0.0, 90.0, 0.0)
+        
+        logic.transform_root_by_offset([clip], pos_offset, rot_offset, "global")
+        
+        # Hip pos: (10,0,0) rotated around (0,0,0) -> (0, 0, -10)
+        _, hip_x, _ = KeyframeDecoder.decode_keyframe(hip.properties["X"][0], 0, 0)
+        _, hip_z, _ = KeyframeDecoder.decode_keyframe(hip.properties["Z"][0], 0, 0)
+        assert hip_x == pytest.approx(0.0, abs=1e-6)
+        assert hip_z == pytest.approx(-10.0)
+
+        # Hand pos: (11,1,0) rotated around (0,0,0) -> (0, 1, -11)
+        _, hand_x, _ = KeyframeDecoder.decode_keyframe(hand.properties["X"][0], 0, 0)
+        _, hand_y, _ = KeyframeDecoder.decode_keyframe(hand.properties["Y"][0], 0, 0)
+        _, hand_z, _ = KeyframeDecoder.decode_keyframe(hand.properties["Z"][0], 0, 0)
+        assert hand_x == pytest.approx(0.0, abs=1e-6)
+        assert hand_y == pytest.approx(1.0)
+        assert hand_z == pytest.approx(-11.0)
+
+        # Both rotations should be updated
+        q_expected = Quaternion.from_euler(0, 90, 0)
+        _, hip_ry, _ = KeyframeDecoder.decode_keyframe(hip.properties["RotY"][0], 0, 0)
+        _, hand_ry, _ = KeyframeDecoder.decode_keyframe(hand.properties["RotY"][0], 0, 0)
+        assert hip_ry == pytest.approx(q_expected.y)
+        assert hand_ry == pytest.approx(q_expected.y)
+
+    def test_transform_local_rotation_only_yaw(self, clip_for_transform_test):
+        logic, clip = clip_for_transform_test
+        hip = clip.controllers[0]
+        hand = clip.controllers[1]
+        
+        pos_offset = (0.0, 0.0, 0.0)
+        rot_offset = (0.0, 90.0, 0.0)
+        
+        logic.transform_root_by_offset([clip], pos_offset, rot_offset, "local")
+        
+        # Hip pos: Pivot, should not move -> (10, 0, 0)
+        _, hip_x, _ = KeyframeDecoder.decode_keyframe(hip.properties["X"][0], 0, 0)
+        _, hip_y, _ = KeyframeDecoder.decode_keyframe(hip.properties["Y"][0], 0, 0)
+        assert hip_x == pytest.approx(10.0)
+        assert hip_y == pytest.approx(0.0)
+
+        # Hand pos: Relative vector (1,1,0) rotated around pivot -> new relative (0,1,-1)
+        # New absolute pos: (10,0,0) + (0,1,-1) -> (10, 1, -1)
+        _, hand_x, _ = KeyframeDecoder.decode_keyframe(hand.properties["X"][0], 0, 0)
+        _, hand_y, _ = KeyframeDecoder.decode_keyframe(hand.properties["Y"][0], 0, 0)
+        _, hand_z, _ = KeyframeDecoder.decode_keyframe(hand.properties["Z"][0], 0, 0)
+        assert hand_x == pytest.approx(10.0)
+        assert hand_y == pytest.approx(1.0)
+        assert hand_z == pytest.approx(-1.0)
+
+        # Both rotations should be updated
+        q_expected = Quaternion.from_euler(0, 90, 0)
+        _, hip_ry, _ = KeyframeDecoder.decode_keyframe(hip.properties["RotY"][0], 0, 0)
+        _, hand_ry, _ = KeyframeDecoder.decode_keyframe(hand.properties["RotY"][0], 0, 0)
+        assert hip_ry == pytest.approx(q_expected.y)
+        assert hand_ry == pytest.approx(q_expected.y)
+
+    def test_transform_does_nothing_if_no_offset(self, clip_for_transform_test):
+        logic, clip = clip_for_transform_test
+        hip = clip.controllers[0]
+        logic.current_file_path = "test.json"
+        
+        original_x_kf = hip.properties["X"][0]
+        original_w_kf = hip.properties["RotW"][0]
+
+        logic.transform_root_by_offset([clip], (0, 0, 0), (0, 0, 0), "global")
+        
+        assert hip.properties["X"][0] == original_x_kf
+        assert hip.properties["RotW"][0] == original_w_kf
+        assert logic.current_file_path == "test.json"

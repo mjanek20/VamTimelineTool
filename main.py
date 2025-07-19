@@ -299,8 +299,9 @@ class MainWindow(QMainWindow):
         
         if dialog.exec():
             pos_offsets, rot_offsets = dialog.get_transform_values()
+            rotation_mode = dialog.get_rotation_mode()
             if pos_offsets is not None and rot_offsets is not None:
-                self.app_logic.transform_root_by_offset(selected_clips, pos_offsets, rot_offsets)
+                self.app_logic.transform_root_by_offset(selected_clips, pos_offsets, rot_offsets, rotation_mode)
 
     def rename_selected_item(self):
         if self.tree.currentItem():

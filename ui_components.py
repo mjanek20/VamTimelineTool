@@ -6,7 +6,7 @@ from PyQt6.QtGui import QIcon, QDrag, QColor, QBrush
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QTreeWidget, QAbstractItemView, QLabel, QMenu,
     QMessageBox, QLineEdit, QListWidget, QListWidgetItem, QFormLayout, QDialog, QDialogButtonBox,
-    QRadioButton, QToolTip, QApplication
+    QRadioButton, QToolTip, QApplication, QGroupBox
 )
 
 from data_models import AnimationClip, FloatParameter, ControllerTarget, TriggerGroup
@@ -468,7 +468,9 @@ class TransformDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Move/Rotate by Offset")
-        layout = QFormLayout(self)
+        main_layout = QVBoxLayout(self)
+        
+        form_layout = QFormLayout()
         
         self.x_edit = QLineEdit()
         self.y_edit = QLineEdit()
@@ -477,18 +479,31 @@ class TransformDialog(QDialog):
         self.rot_y_edit = QLineEdit()
         self.rot_z_edit = QLineEdit()
         
-        layout.addRow("X Offset:", self.x_edit)
-        layout.addRow("Y Offset:", self.y_edit)
-        layout.addRow("Z Offset:", self.z_edit)
-        layout.addRow(QLabel("--- Rotation (Degrees) ---"))
-        layout.addRow("X Rotation (Pitch):", self.rot_x_edit)
-        layout.addRow("Y Rotation (Yaw):", self.rot_y_edit)
-        layout.addRow("Z Rotation (Roll):", self.rot_z_edit)
+        form_layout.addRow("X Offset:", self.x_edit)
+        form_layout.addRow("Y Offset:", self.y_edit)
+        form_layout.addRow("Z Offset:", self.z_edit)
+        form_layout.addRow(QLabel("--- Rotation (Degrees) ---"))
+        form_layout.addRow("X Rotation (Pitch):", self.rot_x_edit)
+        form_layout.addRow("Y Rotation (Yaw):", self.rot_y_edit)
+        form_layout.addRow("Z Rotation (Roll):", self.rot_z_edit)
+        
+        main_layout.addLayout(form_layout)
+        
+        # Rotation Mode Options
+        self.rot_mode_group = QGroupBox("Rotation Mode")
+        rot_mode_layout = QVBoxLayout()
+        self.global_radio = QRadioButton("Global (around world 0,0,0)")
+        self.global_radio.setChecked(True)
+        self.local_radio = QRadioButton("Local (around character axis)")
+        rot_mode_layout.addWidget(self.global_radio)
+        rot_mode_layout.addWidget(self.local_radio)
+        self.rot_mode_group.setLayout(rot_mode_layout)
+        main_layout.addWidget(self.rot_mode_group)
         
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        main_layout.addWidget(buttons)
         
     def set_initial_values(self, x, y, z, rot_x, rot_y, rot_z):
         self.x_edit.setText(f"{x:.4f}")
@@ -506,6 +521,11 @@ class TransformDialog(QDialog):
         except ValueError:
             QMessageBox.warning(self, "Invalid Input", "Please enter valid numbers for all offsets and rotations.")
             return None, None
+
+    def get_rotation_mode(self):
+        if self.local_radio.isChecked():
+            return "local"
+        return "global"
 
 class MergeConflictDialog(QDialog):
     def __init__(self, parent=None):
