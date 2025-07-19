@@ -11,6 +11,68 @@ from data_models import AnimationFile, AnimationClip, FloatParameter, Controller
 from keyframe_logic import KeyframeEncoder, KeyframeDecoder
 from enums import DropActionType
 
+# Helper class for Quaternion math
+class Quaternion:
+    """A simple helper class for quaternion operations."""
+    def __init__(self, x=0.0, y=0.0, z=0.0, w=1.0):
+        self.x, self.y, self.z, self.w = x, y, z, w
+
+    @classmethod
+    def from_euler(cls, pitch_deg, yaw_deg, roll_deg):
+        """
+        Creates a quaternion from Euler angles (pitch, yaw, roll) in degrees.
+        Applies rotations in Z-Y-X order, which is common in VaM/Unity.
+        """
+        pitch = math.radians(pitch_deg)  # Rotation about X
+        yaw = math.radians(yaw_deg)      # Rotation about Y
+        roll = math.radians(roll_deg)    # Rotation about Z
+
+        # Create elemental quaternions for each axis
+        q_pitch = cls(x=math.sin(pitch * 0.5), y=0, z=0, w=math.cos(pitch * 0.5))
+        q_yaw   = cls(x=0, y=math.sin(yaw * 0.5),   z=0, w=math.cos(yaw * 0.5))
+        q_roll  = cls(x=0, y=0, z=math.sin(roll * 0.5),  w=math.cos(roll * 0.5))
+        
+        # Combine them in Z-Y-X order: q_final = q_yaw * q_pitch * q_roll
+        # This order is crucial.
+        q_final = q_yaw * q_pitch * q_roll
+        return q_final
+        
+    def __mul__(self, other):
+        """Quaternion multiplication (self * other)."""
+        w1, x1, y1, z1 = self.w, self.x, self.y, self.z
+        w2, x2, y2, z2 = other.w, other.x, other.y, other.z
+        
+        new_w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        new_x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        new_y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        new_z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+        return Quaternion(new_x, new_y, new_z, new_w)
+
+    def conjugate(self):
+        """Returns the conjugate of the quaternion."""
+        return Quaternion(-self.x, -self.y, -self.z, self.w)
+
+    def rotate_vector(self, vec):
+        """
+        Rotates a 3D vector by this quaternion.
+        vec should be a tuple (x, y, z).
+        The operation is p' = q * p * q^-1
+        """
+        p = Quaternion(vec[0], vec[1], vec[2], 0.0)
+        q_conj = self.conjugate()
+        p_rotated = self * p * q_conj
+        return (p_rotated.x, p_rotated.y, p_rotated.z)
+
+    def normalize(self):
+        mag = math.sqrt(self.x**2 + self.y**2 + self.z**2 + self.w**2)
+        if mag > 1e-9:
+            self.x /= mag
+            self.y /= mag
+            self.z /= mag
+            self.w /= mag
+        else:
+            self.x, self.y, self.z, self.w = 0, 0, 0, 1
+
 class MergeError(Exception):
     """Custom exception for merge failures."""
     pass
@@ -575,11 +637,126 @@ class AppLogic(QObject):
         self.log_requested.emit(f"Root centering (XZ only) finished. Processed {processed_count} clip(s).")
         self.mark_as_dirty()
 
-    def move_root_by_offset(self, clips_to_process, offsets):
-        self.log_requested.emit(f"Applying manual offset {offsets} to {len(clips_to_process)} clip(s)...")
-        processed_count = self._apply_position_delta_to_clips(clips_to_process, offsets)
-        self.log_requested.emit(f"Manual offset operation finished. Processed {processed_count} clip(s).")
-        self.mark_as_dirty()
+    def transform_root_by_offset(self, clips_to_process, pos_offsets, rot_offsets_deg):
+        pos_str = f"Pos:({pos_offsets[0]:.3f}, {pos_offsets[1]:.3f}, {pos_offsets[2]:.3f})"
+        rot_str = f"Rot:({rot_offsets_deg[0]:.2f}, {rot_offsets_deg[1]:.2f}, {rot_offsets_deg[2]:.2f})"
+        self.log_requested.emit(f"Applying global transform {pos_str} {rot_str} to {len(clips_to_process)} clip(s)...")
+
+        pos_changed = any(not math.isclose(p, 0.0, abs_tol=1e-6) for p in pos_offsets)
+        rot_changed = any(not math.isclose(r, 0.0, abs_tol=1e-6) for r in rot_offsets_deg)
+        
+        if not pos_changed and not rot_changed:
+            self.log_requested.emit("Manual transform operation cancelled: No offset or rotation provided.")
+            return
+
+        processed_count = self._apply_global_transform_to_clips(clips_to_process, pos_offsets, rot_offsets_deg)
+        
+        if processed_count > 0:
+            self.log_requested.emit(f"Global transform operation finished. Processed {processed_count} clip(s).")
+            self.mark_as_dirty()
+        else:
+            self.log_requested.emit(f"Global transform operation finished. No clips were processed.")
+
+    def _apply_global_transform_to_clips(self, clips, pos_delta, rot_delta_euler_deg):
+        """
+        Applies a global transformation (rotation then translation) to all keyframes
+        of all controllers in the provided clips.
+        Rotation is applied around the world origin (0,0,0).
+        """
+        q_offset = Quaternion.from_euler(rot_delta_euler_deg[0], rot_delta_euler_deg[1], rot_delta_euler_deg[2])
+        processed_count = 0
+
+        pos_axes = {'X': 0, 'Y': 1, 'Z': 2}
+        rot_axes = {'RotX': 'x', 'RotY': 'y', 'RotZ': 'z', 'RotW': 'w'}
+        
+        for clip in clips:
+            try:
+                for controller in clip.controllers:
+                    if controller.id.endswith("Rotation"): continue # Skip 'Rotation' pseudo-controllers
+                    
+                    # 1. Gather all keyframes for this controller, grouped by time
+                    keyframe_map = defaultdict(dict)
+                    
+                    # Gather position keyframes
+                    for prop, idx in pos_axes.items():
+                        last_v, last_c = 0.0, 3
+                        for kf_str in controller.properties.get(prop, []):
+                            t, v, c = KeyframeDecoder.decode_keyframe(kf_str, last_v, last_c)
+                            keyframe_map[t][prop] = {'v': v, 'c': c}
+                            last_v, last_c = v, c
+                    
+                    # Gather rotation keyframes
+                    for prop, comp in rot_axes.items():
+                        last_v, last_c = (1.0, 3) if prop == 'RotW' else (0.0, 3)
+                        for kf_str in controller.properties.get(prop, []):
+                            t, v, c = KeyframeDecoder.decode_keyframe(kf_str, last_v, last_c)
+                            keyframe_map[t][prop] = {'v': v, 'c': c}
+                            last_v, last_c = v, c
+                            
+                    if not keyframe_map: continue
+
+                    # 2. Process keyframes chronologically
+                    new_kfs = defaultdict(list)
+                    last_known_pos = [0.0, 0.0, 0.0]
+                    last_known_q = Quaternion(0, 0, 0, 1)
+                    last_encoded_pos = [0.0, 0.0, 0.0]
+                    # --- POCZĄTEK POPRAWKI ---
+                    last_encoded_q = Quaternion(0, 0, 0, 0) # Zmieniono w=1 na w=0, aby wymusić zapis pierwszej klatki.
+                    # --- KONIEC POPRAWKI ---
+                    last_c_pos = {p: 3 for p in pos_axes}
+                    last_c_rot = {p: 3 for p in rot_axes}
+
+                    for t in sorted(keyframe_map.keys()):
+                        kfs_at_t = keyframe_map[t]
+                        
+                        # Reconstruct original state at time t by updating with new values
+                        for prop, idx in pos_axes.items():
+                            if prop in kfs_at_t: last_known_pos[idx] = kfs_at_t[prop]['v']
+                        for prop, comp in rot_axes.items():
+                            if prop in kfs_at_t: setattr(last_known_q, comp, kfs_at_t[prop]['v'])
+                        
+                        # 3. Apply transformations
+                        # a) Rotate original position vector around origin
+                        rotated_pos_vec = q_offset.rotate_vector(tuple(last_known_pos))
+                        # b) Add translation offset
+                        new_pos_vec = [rotated_pos_vec[i] + pos_delta[i] for i in range(3)]
+                        # c) Compose original orientation with offset rotation
+                        new_q = q_offset * last_known_q
+                        new_q.normalize()
+
+                        # 4. Encode new keyframes
+                        c_pos_unified = kfs_at_t.get('X', {}).get('c', last_c_pos['X'])
+                        c_rot_unified = kfs_at_t.get('RotW', {}).get('c', last_c_rot['RotW'])
+                        
+                        # Encode position
+                        for prop, idx in pos_axes.items():
+                            new_val = new_pos_vec[idx]
+                            kf_str = KeyframeEncoder.encode_keyframe(t, new_val, c_pos_unified, last_encoded_pos[idx], last_c_pos[prop])
+                            new_kfs[prop].append(kf_str)
+                            if prop in kfs_at_t:
+                                last_encoded_pos[idx] = new_val
+                                last_c_pos[prop] = c_pos_unified
+
+                        # Encode rotation
+                        for prop, comp in rot_axes.items():
+                            new_val = getattr(new_q, comp)
+                            kf_str = KeyframeEncoder.encode_keyframe(t, new_val, c_rot_unified, getattr(last_encoded_q, comp), last_c_rot[prop])
+                            new_kfs[prop].append(kf_str)
+                            if prop in kfs_at_t:
+                                setattr(last_encoded_q, comp, new_val)
+                                last_c_rot[prop] = c_rot_unified
+                    
+                    # 5. Update controller properties with new keyframes
+                    for prop in pos_axes:
+                        if new_kfs[prop]: controller.properties[prop] = new_kfs[prop]
+                    for prop in rot_axes:
+                         if new_kfs[prop]: controller.properties[prop] = new_kfs[prop]
+
+                processed_count += 1
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.log_requested.emit(f"ERROR: Failed to process transform for clip '{clip.name}'. Reason: {e}")
+        return processed_count
 
     def create_new_segment(self, name, target_atom_id):
         if not self.animation_file: return
@@ -714,6 +891,75 @@ class AppLogic(QObject):
                 self.log_requested.emit(f"Renamed layer '{old_layer_name}' to '{new_name}'.")
                 self.mark_as_dirty()
     
+    def _apply_rotation_delta_to_clips(self, clips, rot_delta_euler_deg):
+        """Applies a rotation (in Euler degrees) to the rotation keyframes of controllers."""
+        q_offset = Quaternion.from_euler(rot_delta_euler_deg[0], rot_delta_euler_deg[1], rot_delta_euler_deg[2])
+        processed_count = 0
+
+        for clip in clips:
+            try:
+                for controller in clip.controllers:
+                    rot_props = ['RotX', 'RotY', 'RotZ', 'RotW']
+                    if not any(prop in controller.properties for prop in rot_props):
+                        continue
+
+                    keyframe_map = defaultdict(dict)
+                    rot_axes = {'RotX': 'x', 'RotY': 'y', 'RotZ': 'z', 'RotW': 'w'}
+                    
+                    for prop, comp in rot_axes.items():
+                        last_v, last_c = (0.0, 3) if prop != 'RotW' else (1.0, 3)
+                        for kf_str in controller.properties.get(prop, []):
+                            t, v, c = KeyframeDecoder.decode_keyframe(kf_str, last_v, last_c)
+                            keyframe_map[t][comp] = {'v': v, 'c': c}
+                            last_v, last_c = v, c
+
+                    if not keyframe_map: continue
+
+                    new_kfs = defaultdict(list)
+                    last_q_new = Quaternion(0, 0, 0, 1)
+                    last_c_unified = 3
+                    last_v_orig_components = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0}
+
+                    for t in sorted(keyframe_map.keys()):
+                        kfs_at_t = keyframe_map[t]
+                        
+                        for comp_letter, comp_data in kfs_at_t.items():
+                            last_v_orig_components[comp_letter] = comp_data['v']
+                        
+                        q_orig = Quaternion(
+                            last_v_orig_components['x'], 
+                            last_v_orig_components['y'], 
+                            last_v_orig_components['z'], 
+                            last_v_orig_components['w']
+                        )
+                        
+                        q_new = q_offset * q_orig
+                        q_new.normalize()
+
+                        curve_type = 3
+                        if 'w' in kfs_at_t: curve_type = kfs_at_t['w']['c']
+                        elif 'x' in kfs_at_t: curve_type = kfs_at_t['x']['c']
+                        elif 'y' in kfs_at_t: curve_type = kfs_at_t['y']['c']
+                        elif 'z' in kfs_at_t: curve_type = kfs_at_t['z']['c']
+
+                        for prop, comp in rot_axes.items():
+                            new_val = getattr(q_new, comp)
+                            last_encoded_val = getattr(last_q_new, comp)
+                            new_kfs[comp].append(KeyframeEncoder.encode_keyframe(t, new_val, curve_type, last_encoded_val, last_c_unified))
+
+                        last_q_new = q_new
+                        last_c_unified = curve_type
+
+                    for prop, comp in rot_axes.items():
+                        if new_kfs[comp]:
+                           controller.properties[prop] = new_kfs[comp]
+
+                processed_count += 1
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.log_requested.emit(f"ERROR: Failed to process rotation for clip '{clip.name}'. Reason: {e}")
+        return processed_count
+
     def _apply_position_delta_to_clips(self, clips, delta):
         processed_count = 0
         for clip in clips:

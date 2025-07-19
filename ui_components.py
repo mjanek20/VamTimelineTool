@@ -464,33 +464,48 @@ class ClipPropertiesPanel(QWidget):
         self.main_window.app_logic.process_target_deletion(self.clip, targets_to_delete, scope)
 
 
-class OffsetDialog(QDialog):
+class TransformDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Move by Offset")
+        self.setWindowTitle("Move/Rotate by Offset")
         layout = QFormLayout(self)
+        
         self.x_edit = QLineEdit()
         self.y_edit = QLineEdit()
         self.z_edit = QLineEdit()
+        self.rot_x_edit = QLineEdit()
+        self.rot_y_edit = QLineEdit()
+        self.rot_z_edit = QLineEdit()
+        
         layout.addRow("X Offset:", self.x_edit)
         layout.addRow("Y Offset:", self.y_edit)
         layout.addRow("Z Offset:", self.z_edit)
+        layout.addRow(QLabel("--- Rotation (Degrees) ---"))
+        layout.addRow("X Rotation (Pitch):", self.rot_x_edit)
+        layout.addRow("Y Rotation (Yaw):", self.rot_y_edit)
+        layout.addRow("Z Rotation (Roll):", self.rot_z_edit)
+        
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
         
-    def set_initial_values(self, x, y, z):
+    def set_initial_values(self, x, y, z, rot_x, rot_y, rot_z):
         self.x_edit.setText(f"{x:.4f}")
         self.y_edit.setText(f"{y:.4f}")
         self.z_edit.setText(f"{z:.4f}")
+        self.rot_x_edit.setText(f"{rot_x:.2f}")
+        self.rot_y_edit.setText(f"{rot_y:.2f}")
+        self.rot_z_edit.setText(f"{rot_z:.2f}")
 
-    def get_offsets(self):
+    def get_transform_values(self):
         try:
-            return (float(self.x_edit.text()), float(self.y_edit.text()), float(self.z_edit.text()))
+            pos = (float(self.x_edit.text()), float(self.y_edit.text()), float(self.z_edit.text()))
+            rot = (float(self.rot_x_edit.text()), float(self.rot_y_edit.text()), float(self.rot_z_edit.text()))
+            return pos, rot
         except ValueError:
-            QMessageBox.warning(self, "Invalid Input", "Please enter valid numbers for the offsets.")
-            return None
+            QMessageBox.warning(self, "Invalid Input", "Please enter valid numbers for all offsets and rotations.")
+            return None, None
 
 class MergeConflictDialog(QDialog):
     def __init__(self, parent=None):

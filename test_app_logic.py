@@ -3,9 +3,10 @@ import pytest
 import os
 import json
 import copy
+import math
 
 # Upewnij się, że ten plik jest w tym samym katalogu co inne moduły
-from app_logic import AppLogic, MergeError
+from app_logic import AppLogic, MergeError, Quaternion
 from data_models import AnimationFile, AnimationClip, ControllerTarget, FloatParameter, TriggerGroup
 from keyframe_logic import KeyframeEncoder, KeyframeDecoder
 from enums import DropActionType
@@ -673,3 +674,191 @@ class TestUIInteractions:
         # Dodatkowo, sprawdźmy czy węzeł, który nie był zwinięty, pozostał rozwinięty
         gestures_segment_item_after = self.find_item_by_text(main_window.tree, "Segment: Gestures")
         assert gestures_segment_item_after.isExpanded()
+
+# --- Testy dla nowej funkcjonalności Move/Rotate by Offset ---
+
+@pytest.fixture
+def clip_with_root_controller(app_logic_instance):
+    """
+    Dostarcza instancję AppLogic z jednym klipem, który ma kontroler 'hipControl'
+    z pojedynczą klatką kluczową na początku. Pozycja początkowa to (10, 0, 0).
+    """
+    clip = AnimationClip("TransformTest", "S1", "L1", 2.0)
+    root = ControllerTarget("hipControl")
+    
+    # Klatka kluczowa dla pozycji na (10, 0, 0) w czasie 0.0
+    root.properties["X"] = [KeyframeEncoder.encode_keyframe(0.0, 10.0, 3, 0, 0)]
+    root.properties["Y"] = [KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0, 0)]
+    root.properties["Z"] = [KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0, 0)]
+    
+    # Klatka kluczowa dla rotacji (identyczność) w czasie 0.0
+    root.properties["RotX"] = [KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0, 0)]
+    root.properties["RotY"] = [KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0, 0)]
+    root.properties["RotZ"] = [KeyframeEncoder.encode_keyframe(0.0, 0.0, 3, 0, 0)]
+    root.properties["RotW"] = [KeyframeEncoder.encode_keyframe(0.0, 1.0, 3, 0, 0)]
+    
+    clip.controllers.append(root)
+    app_logic_instance.animation_file = AnimationFile()
+    app_logic_instance.animation_file.clips = [clip]
+    
+    return app_logic_instance, clip, root
+
+class TestTransformations:
+
+    def test_transform_by_offset_position_only(self, clip_with_root_controller):
+        logic, clip, root = clip_with_root_controller
+        
+        pos_offset = (1.5, -2.0, 3.5)
+        rot_offset = (0.0, 0.0, 0.0)
+        
+        logic.transform_root_by_offset([clip], pos_offset, rot_offset)
+        
+        # Oczekiwana nowa pozycja: (10+1.5, 0-2.0, 0+3.5) = (11.5, -2.0, 3.5)
+        _, new_x, _ = KeyframeDecoder.decode_keyframe(root.properties["X"][0], 0, 0)
+        _, new_y, _ = KeyframeDecoder.decode_keyframe(root.properties["Y"][0], 0, 0)
+        _, new_z, _ = KeyframeDecoder.decode_keyframe(root.properties["Z"][0], 0, 0)
+        
+        assert new_x == pytest.approx(11.5)
+        assert new_y == pytest.approx(-2.0)
+        assert new_z == pytest.approx(3.5)
+        
+        # Rotacja powinna pozostać niezmieniona
+        _, new_w, _ = KeyframeDecoder.decode_keyframe(root.properties["RotW"][0], 0, 0)
+        assert new_w == pytest.approx(1.0)
+
+    def test_transform_by_offset_rotation_only_yaw(self, clip_with_root_controller):
+        logic, clip, root = clip_with_root_controller
+        
+        pos_offset = (0.0, 0.0, 0.0)
+        rot_offset = (0.0, 90.0, 0.0) # 90 stopni odchylenia (Yaw)
+        
+        logic.transform_root_by_offset([clip], pos_offset, rot_offset)
+        
+        # Weryfikacja pozycji: rotacja (10, 0, 0) o 90 stopni wokół Y daje (0, 0, -10)
+        _, new_x, _ = KeyframeDecoder.decode_keyframe(root.properties["X"][0], 0, 0)
+        _, new_y, _ = KeyframeDecoder.decode_keyframe(root.properties["Y"][0], 0, 0)
+        _, new_z, _ = KeyframeDecoder.decode_keyframe(root.properties["Z"][0], 0, 0)
+        
+        assert new_x == pytest.approx(0.0, abs=1e-6)
+        assert new_y == pytest.approx(0.0)
+        assert new_z == pytest.approx(-10.0)
+        
+        # Weryfikacja rotacji: nowa rotacja to q_yaw(90)
+        q_expected = Quaternion.from_euler(0, 90, 0)
+        
+        _, new_rx, _ = KeyframeDecoder.decode_keyframe(root.properties["RotX"][0], 0, 0)
+        _, new_ry, _ = KeyframeDecoder.decode_keyframe(root.properties["RotY"][0], 0, 0)
+        _, new_rz, _ = KeyframeDecoder.decode_keyframe(root.properties["RotZ"][0], 0, 0)
+        _, new_rw, _ = KeyframeDecoder.decode_keyframe(root.properties["RotW"][0], 0, 0)
+        
+        assert new_rx == pytest.approx(q_expected.x)
+        assert new_ry == pytest.approx(q_expected.y)
+        assert new_rz == pytest.approx(q_expected.z)
+        assert new_rw == pytest.approx(q_expected.w)
+
+    def test_transform_by_offset_combined_transform(self, clip_with_root_controller):
+        logic, clip, root = clip_with_root_controller
+        
+        pos_offset = (0.0, 0.0, 20.0)
+        rot_offset = (-90.0, 0.0, 0.0) # -90 stopni pochylenia (Pitch)
+        
+        logic.transform_root_by_offset([clip], pos_offset, rot_offset)
+
+        # Weryfikacja pozycji: rotacja (10, 0, 0) o -90 stopni wokół X daje (10, 0, 0).
+        # Następnie dodajemy offset (0, 0, 20), co daje (10, 0, 20).
+        _, new_x, _ = KeyframeDecoder.decode_keyframe(root.properties["X"][0], 0, 0)
+        _, new_y, _ = KeyframeDecoder.decode_keyframe(root.properties["Y"][0], 0, 0)
+        _, new_z, _ = KeyframeDecoder.decode_keyframe(root.properties["Z"][0], 0, 0)
+        assert new_x == pytest.approx(10.0)
+        assert new_y == pytest.approx(0.0)
+        assert new_z == pytest.approx(20.0)
+        
+        # Weryfikacja rotacji: nowa rotacja to q_pitch(-90)
+        q_expected = Quaternion.from_euler(-90, 0, 0)
+        _, new_rx, _ = KeyframeDecoder.decode_keyframe(root.properties["RotX"][0], 0, 0)
+        _, new_ry, _ = KeyframeDecoder.decode_keyframe(root.properties["RotY"][0], 0, 0)
+        _, new_rz, _ = KeyframeDecoder.decode_keyframe(root.properties["RotZ"][0], 0, 0)
+        _, new_rw, _ = KeyframeDecoder.decode_keyframe(root.properties["RotW"][0], 0, 0)
+        assert new_rx == pytest.approx(q_expected.x)
+        assert new_ry == pytest.approx(q_expected.y)
+        assert new_rz == pytest.approx(q_expected.z)
+        assert new_rw == pytest.approx(q_expected.w)
+
+
+    def test_transform_by_offset_multiple_keyframes(self, clip_with_root_controller):
+        logic, clip, root = clip_with_root_controller
+
+        # Dodaj drugą klatkę kluczową w czasie 1.0
+        # Pozycja oryginalna: (10, 5, 0)
+        # Rotacja oryginalna: 90 stopni przechyłu (Roll) wokół osi Z
+        q_orig_kf2 = Quaternion.from_euler(0, 0, 90)
+        root.properties["X"].append(KeyframeEncoder.encode_keyframe(1.0, 10.0, 3, 10.0, 3))
+        root.properties["Y"].append(KeyframeEncoder.encode_keyframe(1.0, 5.0, 3, 0.0, 3))
+        # Z musi być dodane, nawet jeśli zerowe, bo logika odczytuje wszystkie osie
+        root.properties["Z"].append(KeyframeEncoder.encode_keyframe(1.0, 0.0, 3, 0.0, 3))
+        root.properties["RotX"].append(KeyframeEncoder.encode_keyframe(1.0, q_orig_kf2.x, 3, 0.0, 3))
+        root.properties["RotY"].append(KeyframeEncoder.encode_keyframe(1.0, q_orig_kf2.y, 3, 0.0, 3))
+        root.properties["RotZ"].append(KeyframeEncoder.encode_keyframe(1.0, q_orig_kf2.z, 3, 0.0, 3))
+        root.properties["RotW"].append(KeyframeEncoder.encode_keyframe(1.0, q_orig_kf2.w, 3, 1.0, 3))
+
+        # Zastosuj transformację: przesunięcie Y i obrót Y (Yaw)
+        pos_offset = (0.0, 10.0, 0.0)
+        rot_offset_deg = (0.0, 90.0, 0.0)
+        q_offset = Quaternion.from_euler(*rot_offset_deg)
+        
+        logic.transform_root_by_offset([clip], pos_offset, rot_offset_deg)
+        
+        # --- Weryfikacja klatki w t=0.0 ---
+        # Oryginalna pos: (10, 0, 0). Po rotacji: (0, 0, -10). Po offsecie: (0, 10, -10)
+        _, kf1_x, _ = KeyframeDecoder.decode_keyframe(root.properties["X"][0], 0, 0)
+        _, kf1_y, _ = KeyframeDecoder.decode_keyframe(root.properties["Y"][0], 0, 0)
+        _, kf1_z, _ = KeyframeDecoder.decode_keyframe(root.properties["Z"][0], 0, 0)
+        assert kf1_x == pytest.approx(0.0, abs=1e-6)
+        assert kf1_y == pytest.approx(10.0)
+        assert kf1_z == pytest.approx(-10.0)
+
+        # --- Weryfikacja klatki w t=1.0 ---
+        # Oryginalna pos: (10, 5, 0). Po rotacji o 90 stopni wokół Y -> (0, 5, -10). Po offsecie: (0, 15, -10)
+        _, kf2_x, _ = KeyframeDecoder.decode_keyframe(root.properties["X"][1], kf1_x, 3)
+        _, kf2_y, _ = KeyframeDecoder.decode_keyframe(root.properties["Y"][1], kf1_y, 3)
+        _, kf2_z, _ = KeyframeDecoder.decode_keyframe(root.properties["Z"][1], kf1_z, 3)
+        assert kf2_x == pytest.approx(0.0, abs=1e-6)
+        assert kf2_y == pytest.approx(15.0)
+        assert kf2_z == pytest.approx(-10.0)
+
+        # Weryfikacja rotacji: q_new = q_offset * q_orig_kf2
+        q_expected_kf2 = q_offset * q_orig_kf2
+        
+        _, kf1_rx, _ = KeyframeDecoder.decode_keyframe(root.properties["RotX"][0], 0, 0)
+        _, kf1_ry, _ = KeyframeDecoder.decode_keyframe(root.properties["RotY"][0], 0, 0)
+        _, kf1_rz, _ = KeyframeDecoder.decode_keyframe(root.properties["RotZ"][0], 0, 0)
+        _, kf1_rw, _ = KeyframeDecoder.decode_keyframe(root.properties["RotW"][0], 0, 0)
+
+        _, kf2_rx, _ = KeyframeDecoder.decode_keyframe(root.properties["RotX"][1], kf1_rx, 3)
+        _, kf2_ry, _ = KeyframeDecoder.decode_keyframe(root.properties["RotY"][1], kf1_ry, 3)
+        _, kf2_rz, _ = KeyframeDecoder.decode_keyframe(root.properties["RotZ"][1], kf1_rz, 3)
+        _, kf2_rw, _ = KeyframeDecoder.decode_keyframe(root.properties["RotW"][1], kf1_rw, 3)
+        
+        assert kf2_rx == pytest.approx(q_expected_kf2.x)
+        assert kf2_ry == pytest.approx(q_expected_kf2.y)
+        assert kf2_rz == pytest.approx(q_expected_kf2.z)
+        assert kf2_rw == pytest.approx(q_expected_kf2.w)
+
+
+    def test_transform_does_nothing_if_no_offset(self, clip_with_root_controller):
+        logic, clip, root = clip_with_root_controller
+        logic.current_file_path = "test.json" # Symulacja załadowanego pliku
+        
+        # Kopiujemy oryginalne wartości
+        original_x_kf = root.properties["X"][0]
+        original_w_kf = root.properties["RotW"][0]
+
+        # Wywołujemy z zerowymi offsetami
+        logic.transform_root_by_offset([clip], (0, 0, 0), (0, 0, 0))
+        
+        # Wartości nie powinny się zmienić
+        assert root.properties["X"][0] == original_x_kf
+        assert root.properties["RotW"][0] == original_w_kf
+        
+        # Plik nie powinien być oznaczony jako zmodyfikowany
+        assert logic.current_file_path == "test.json"

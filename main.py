@@ -17,7 +17,7 @@ from ui_styles import DARK_STYLE
 from data_models import AnimationClip
 from ui_components import (
     AnimationTreeWidget, ClipPropertiesPanel, MergeConflictDialog,
-    BatchRenameDialog, OffsetDialog
+    BatchRenameDialog, TransformDialog
 )
 from app_logic import AppLogic, MergeError
 
@@ -55,12 +55,12 @@ class MainWindow(QMainWindow):
         duplicate_clip_action=QAction("&Duplicate Clip",self);duplicate_clip_action.setShortcut("Ctrl+D");duplicate_clip_action.triggered.connect(self.duplicate_selected_clip)
         self.duplicate_segment_action=QAction("Duplicate Se&gment", self);self.duplicate_segment_action.triggered.connect(self.duplicate_selected_segment)
         center_root_action=QAction("Center &Root on First Frame",self);center_root_action.triggered.connect(self.center_root_on_first_frame)
-        move_by_offset_action = QAction("Move by &Offset...", self); move_by_offset_action.triggered.connect(self.move_root_by_offset)
+        transform_by_offset_action = QAction("Move/Rotate by &Offset...", self); transform_by_offset_action.triggered.connect(self.transform_root_by_offset)
         self.dark_mode_action = QAction("&Dark Mode", self); self.dark_mode_action.setCheckable(True); self.dark_mode_action.toggled.connect(self.toggle_dark_mode)
 
         menu_bar=self.menuBar()
         file_menu=menu_bar.addMenu("&File");file_menu.addAction(self.open_action);file_menu.addAction(self.save_as_action);file_menu.addSeparator();file_menu.addAction(self.new_segment_action);file_menu.addSeparator();file_menu.addAction(exit_action)
-        edit_menu=menu_bar.addMenu("&Edit");edit_menu.addAction(rename_action);edit_menu.addAction(batch_rename_action);edit_menu.addAction(duplicate_clip_action);edit_menu.addAction(self.duplicate_segment_action);edit_menu.addSeparator();edit_menu.addAction(center_root_action);edit_menu.addAction(move_by_offset_action);edit_menu.addSeparator();edit_menu.addAction(self.delete_action)
+        edit_menu=menu_bar.addMenu("&Edit");edit_menu.addAction(rename_action);edit_menu.addAction(batch_rename_action);edit_menu.addAction(duplicate_clip_action);edit_menu.addAction(self.duplicate_segment_action);edit_menu.addSeparator();edit_menu.addAction(center_root_action);edit_menu.addAction(transform_by_offset_action);edit_menu.addSeparator();edit_menu.addAction(self.delete_action)
         view_menu=menu_bar.addMenu("&View"); view_menu.addAction(self.dark_mode_action)
         
         toolbar=self.addToolBar("Main Toolbar");toolbar.addAction(self.open_action);toolbar.addAction(self.save_as_action);toolbar.addSeparator();toolbar.addAction(self.new_segment_action);toolbar.addAction(self.delete_action)
@@ -287,20 +287,20 @@ class MainWindow(QMainWindow):
             return
         self.app_logic.center_root_on_first_frame(selected_clips)
         
-    def move_root_by_offset(self):
+    def transform_root_by_offset(self):
         selected_clips = [item.data(0, 1000) for item in self.tree.selectedItems() if isinstance(item.data(0, 1000), AnimationClip)]
         if not selected_clips:
             QMessageBox.warning(self, "Invalid Selection", "Please select valid animation clips.")
             return
 
-        dialog = OffsetDialog(self)
+        dialog = TransformDialog(self)
         last_delta = self.app_logic.last_center_root_delta_xz
-        dialog.set_initial_values(last_delta[0], 0.0, last_delta[1])
+        dialog.set_initial_values(last_delta[0], 0.0, last_delta[1], 0.0, 0.0, 0.0)
         
         if dialog.exec():
-            offsets = dialog.get_offsets()
-            if offsets:
-                self.app_logic.move_root_by_offset(selected_clips, offsets)
+            pos_offsets, rot_offsets = dialog.get_transform_values()
+            if pos_offsets is not None and rot_offsets is not None:
+                self.app_logic.transform_root_by_offset(selected_clips, pos_offsets, rot_offsets)
 
     def rename_selected_item(self):
         if self.tree.currentItem():
